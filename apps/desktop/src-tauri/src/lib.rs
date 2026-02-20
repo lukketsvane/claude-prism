@@ -80,6 +80,7 @@ pub fn run() {
             claude::continue_claude_code,
             claude::resume_claude_code,
             claude::cancel_claude_execution,
+            claude::run_shell_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

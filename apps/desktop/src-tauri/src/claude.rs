@@ -339,3 +339,36 @@ pub async fn cancel_claude_execution(
     }
     Ok(())
 }
+
+// ─── Shell Command Execution ───
+
+#[derive(serde::Serialize)]
+pub struct ShellCommandResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[tauri::command]
+pub async fn run_shell_command(
+    command: String,
+    cwd: String,
+) -> Result<ShellCommandResult, String> {
+    let args = vec!["-c".to_string(), command];
+    let mut cmd = create_command("sh", args, &cwd);
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn command: {}", e))?;
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("Failed to wait for command: {}", e))?;
+
+    Ok(ShellCommandResult {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}

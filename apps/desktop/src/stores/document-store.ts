@@ -5,9 +5,12 @@ import {
   writeTexFileContent,
   readImageAsDataUrl,
   createFileOnDisk,
+  copyFileToProject,
   deleteFileFromDisk,
   renameFileOnDisk,
+  createDirectory,
   join,
+  type ProjectFileType,
 } from "@/lib/tauri/fs";
 
 export interface ProjectFile {
@@ -15,7 +18,7 @@ export interface ProjectFile {
   name: string;
   relativePath: string;
   absolutePath: string;
-  type: "tex" | "image" | "bib";
+  type: ProjectFileType;
   content?: string;
   dataUrl?: string;
   isDirty: boolean;
@@ -24,6 +27,7 @@ export interface ProjectFile {
 interface DocumentState {
   projectRoot: string | null;
   files: ProjectFile[];
+  folders: string[];
   activeFileId: string;
   cursorPosition: number;
   selectionRange: { start: number; end: number } | null;
@@ -58,8 +62,11 @@ interface DocumentState {
   saveFile: (id: string) => Promise<void>;
   saveAllFiles: () => Promise<void>;
   saveCurrentFile: () => Promise<void>;
-  createNewFile: (name: string, type: "tex" | "image") => Promise<void>;
+  createNewFile: (name: string, type: "tex" | "image", folder?: string) => Promise<void>;
+  createFolder: (name: string, parentFolder?: string) => Promise<void>;
+  importFiles: (sourcePaths: string[], targetFolder?: string) => Promise<void>;
   reloadFile: (relativePath: string) => Promise<void>;
+  refreshFiles: () => Promise<void>;
 
   get fileName(): string;
   get content(): string;
@@ -92,6 +99,7 @@ function scheduleAutoSave() {
 export const useDocumentStore = create<DocumentState>()((set, get) => ({
   projectRoot: null,
   files: [],
+  folders: [],
   activeFileId: "",
   cursorPosition: 0,
   selectionRange: null,
@@ -104,7 +112,7 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
   initialized: false,
 
   openProject: async (rootPath: string) => {
-    const fsFiles = await scanProjectFolder(rootPath);
+    const { files: fsFiles, folders: fsFolders } = await scanProjectFolder(rootPath);
     const projectFiles: ProjectFile[] = [];
 
     for (const f of fsFiles) {
@@ -117,8 +125,8 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
         isDirty: false,
       };
 
-      // Load content for tex/bib files
-      if (f.type === "tex" || f.type === "bib") {
+      // Load content for text-based files
+      if (f.type === "tex" || f.type === "bib" || f.type === "style" || f.type === "other") {
         try {
           pf.content = await readTexFileContent(f.absolutePath);
         } catch {
@@ -146,6 +154,7 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
     set({
       projectRoot: rootPath,
       files: projectFiles,
+      folders: fsFolders,
       activeFileId: mainTex?.id || projectFiles[0]?.id || "",
       pdfData: null,
       compileError: null,
@@ -159,6 +168,7 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
     set({
       projectRoot: null,
       files: [],
+      folders: [],
       activeFileId: "",
       pdfData: null,
       compileError: null,
@@ -250,7 +260,7 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
   insertAtCursor: (text) => {
     const state = get();
     const activeFile = getActiveFile(state);
-    if (!activeFile || (activeFile.type !== "tex" && activeFile.type !== "bib"))
+    if (!activeFile || (activeFile.type === "image"))
       return;
 
     const content = activeFile.content ?? "";
@@ -271,7 +281,7 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
   replaceSelection: (start, end, text) => {
     const state = get();
     const activeFile = getActiveFile(state);
-    if (!activeFile || (activeFile.type !== "tex" && activeFile.type !== "bib"))
+    if (!activeFile || (activeFile.type === "image"))
       return;
 
     const content = activeFile.content ?? "";
@@ -290,7 +300,7 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
   findAndReplace: (find, replace) => {
     const state = get();
     const activeFile = getActiveFile(state);
-    if (!activeFile || (activeFile.type !== "tex" && activeFile.type !== "bib"))
+    if (!activeFile || (activeFile.type === "image"))
       return false;
 
     const content = activeFile.content ?? "";
@@ -338,17 +348,17 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
     await state.saveFile(state.activeFileId);
   },
 
-  createNewFile: async (name, type) => {
+  createNewFile: async (name, type, folder) => {
     const state = get();
     if (!state.projectRoot) return;
 
+    const relativePath = folder ? `${folder}/${name}` : name;
     const content =
       type === "tex"
         ? `\\documentclass{article}\n\n\\begin{document}\n\n% Your content here\n\n\\end{document}\n`
         : "";
 
-    const fullPath = await createFileOnDisk(state.projectRoot, name, content);
-    const relativePath = name;
+    const fullPath = await createFileOnDisk(state.projectRoot, relativePath, content);
 
     set((s) => ({
       files: [
@@ -367,6 +377,30 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
     }));
   },
 
+  createFolder: async (name, parentFolder) => {
+    const state = get();
+    if (!state.projectRoot) return;
+
+    const relativePath = parentFolder ? `${parentFolder}/${name}` : name;
+    const absolutePath = await join(state.projectRoot, relativePath);
+    await createDirectory(absolutePath);
+    set((s) => ({
+      folders: [...s.folders, relativePath],
+    }));
+  },
+
+  importFiles: async (sourcePaths, targetFolder) => {
+    const state = get();
+    if (!state.projectRoot) return;
+
+    for (const sourcePath of sourcePaths) {
+      const fileName = sourcePath.split("/").pop() || sourcePath;
+      const targetName = targetFolder ? `${targetFolder}/${fileName}` : fileName;
+      await copyFileToProject(state.projectRoot, sourcePath, targetName);
+    }
+    await state.refreshFiles();
+  },
+
   reloadFile: async (relativePath) => {
     const state = get();
     const file = state.files.find((f) => f.relativePath === relativePath);
@@ -380,6 +414,52 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
         ),
       }));
     }
+  },
+
+  refreshFiles: async () => {
+    const { projectRoot, files, activeFileId } = get();
+    if (!projectRoot) return;
+
+    const { files: fsFiles, folders: fsFolders } = await scanProjectFolder(projectRoot);
+    const existingPaths = new Set(files.map((f) => f.relativePath));
+    const diskPaths = new Set(fsFiles.map((f) => f.relativePath));
+
+    // Find new files on disk that aren't in the store
+    const newFiles: ProjectFile[] = [];
+    for (const fsFile of fsFiles) {
+      if (!existingPaths.has(fsFile.relativePath)) {
+        const pf: ProjectFile = {
+          id: fsFile.relativePath,
+          name: fsFile.relativePath.split("/").pop() || fsFile.relativePath,
+          relativePath: fsFile.relativePath,
+          absolutePath: fsFile.absolutePath,
+          type: fsFile.type,
+          isDirty: false,
+        };
+        if (pf.type === "tex" || pf.type === "bib" || pf.type === "style" || pf.type === "other") {
+          try {
+            pf.content = await readTexFileContent(pf.absolutePath);
+          } catch { /* skip unreadable */ }
+        } else if (pf.type === "image") {
+          try {
+            pf.dataUrl = await readImageAsDataUrl(pf.absolutePath);
+          } catch { /* skip unreadable */ }
+        }
+        newFiles.push(pf);
+      }
+    }
+
+    // Remove files from store that no longer exist on disk (keep dirty ones)
+    const kept = files.filter(
+      (f) => diskPaths.has(f.relativePath) || f.isDirty,
+    );
+
+    const merged = [...kept, ...newFiles];
+    const newActiveId = merged.some((f) => f.id === activeFileId)
+      ? activeFileId
+      : merged[0]?.id ?? "";
+
+    set({ files: merged, folders: fsFolders, activeFileId: newActiveId });
   },
 
   get fileName() {

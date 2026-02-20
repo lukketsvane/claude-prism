@@ -32,6 +32,31 @@ export async function compileLatex(
   return new Uint8Array(arrayBuffer);
 }
 
+export interface SynctexResult {
+  file: string;
+  line: number;
+  column: number;
+}
+
+export async function synctexEdit(
+  projectDir: string,
+  page: number,
+  x: number,
+  y: number,
+): Promise<SynctexResult | null> {
+  try {
+    const response = await fetch(`${SIDECAR_URL}/synctex/edit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectDir, page, x, y }),
+    });
+    if (!response.ok) return null;
+    return response.json();
+  } catch {
+    return null;
+  }
+}
+
 export async function compileLatexWithResources(
   resources: CompileResource[],
 ): Promise<Uint8Array> {

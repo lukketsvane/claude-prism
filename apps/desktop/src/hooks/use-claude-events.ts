@@ -5,6 +5,9 @@ import {
   type ClaudeStreamMessage,
 } from "@/stores/claude-chat-store";
 import { useDocumentStore } from "@/stores/document-store";
+import { useProposedChangesStore } from "@/stores/proposed-changes-store";
+import { readTexFileContent } from "@/lib/tauri/fs";
+import { compileLatex } from "@/lib/latex-compiler";
 
 /**
  * Hook that manages Tauri event listeners for Claude CLI streaming output.
@@ -23,7 +26,6 @@ export function useClaudeEvents() {
   useEffect(() => {
     if (!isStreaming) return;
 
-    const store = useClaudeChatStore.getState();
     currentSessionIdRef.current = null;
 
     // Track tool_use messages for matching with tool_results
@@ -32,6 +34,66 @@ export function useClaudeEvents() {
       { name: string; input: any }
     >();
 
+    // Track whether any LaTeX-related files were modified during this session
+    let hasTexChanges = false;
+
+    // Register a proposed change instead of immediately reloading the file
+    async function registerProposedChange(
+      filePath: string,
+      toolUseId: string,
+      toolName: string
+    ) {
+      console.log("[proposed-change] registerProposedChange called:", { filePath, toolUseId, toolName });
+      const docState = useDocumentStore.getState();
+      const projectRoot = docState.projectRoot;
+      // Normalize path: Claude may report absolute or relative
+      let relativePath = filePath;
+      if (projectRoot && filePath.startsWith(projectRoot)) {
+        relativePath = filePath.slice(projectRoot.length).replace(/^\//, "");
+      }
+      console.log("[proposed-change] normalized:", { relativePath, projectRoot, fileCount: docState.files.length });
+      const file = docState.files.find(
+        (f) => f.relativePath === relativePath || f.absolutePath === filePath
+      );
+      if (!file) {
+        console.warn("[proposed-change] file not found in store, paths:", docState.files.map(f => f.relativePath));
+        return;
+      }
+
+      // Use the original content from the store (before any Claude edits)
+      // If there's already a pending change for this file, use its oldContent
+      const existingChange = useProposedChangesStore.getState().getChangeForFile(file.relativePath);
+      const oldContent = existingChange?.oldContent ?? file.content ?? "";
+
+      try {
+        const newContent = await readTexFileContent(file.absolutePath);
+        console.log("[proposed-change] content comparison:", {
+          oldLen: oldContent.length,
+          newLen: newContent.length,
+          same: oldContent === newContent,
+        });
+        if (oldContent !== newContent) {
+          // Remove existing change for same file (if Claude made multiple edits)
+          if (existingChange) {
+            useProposedChangesStore.getState().resolveChange(existingChange.id);
+          }
+          useProposedChangesStore.getState().addChange({
+            id: toolUseId,
+            filePath: file.relativePath,
+            absolutePath: file.absolutePath,
+            oldContent,
+            newContent,
+            toolName,
+          });
+          console.log("[proposed-change] added change for:", file.relativePath);
+        } else {
+          console.log("[proposed-change] content identical, skipping");
+        }
+      } catch (err) {
+        console.error("[proposed-change] readTexFileContent failed:", err);
+      }
+    }
+
     function handleStreamMessage(payload: string) {
       let msg: ClaudeStreamMessage;
       try {
@@ -39,6 +101,13 @@ export function useClaudeEvents() {
       } catch {
         return;
       }
+
+      console.log(
+        `[claude-stream] type=${msg.type} subtype=${msg.subtype ?? ""} ` +
+        `contentTypes=[${msg.message?.content?.map((b) => b.type).join(",") ?? "none"}] ` +
+        `texts=[${msg.message?.content?.filter((b) => b.type === "text").map((b) => `"${(b.text ?? "").slice(0, 50)}"`).join(",") ?? ""}] ` +
+        `result=${msg.result ? `"${msg.result.slice(0, 80)}"` : "none"}`
+      );
 
       const chatStore = useClaudeChatStore.getState();
 
@@ -58,6 +127,7 @@ export function useClaudeEvents() {
       if (msg.type === "assistant" && msg.message?.content) {
         for (const block of msg.message.content) {
           if (block.type === "tool_use" && block.id && block.name) {
+            console.log("[claude-events] tracked tool_use:", { id: block.id, name: block.name, input_keys: block.input ? Object.keys(block.input) : [] });
             pendingToolUses.set(block.id, {
               name: block.name,
               input: block.input,
@@ -66,11 +136,16 @@ export function useClaudeEvents() {
         }
       }
 
-      // Detect file modifications from tool_results
+      // Detect file modifications from tool_results → register as proposed changes
       if (msg.type === "user" && msg.message?.content) {
         for (const block of msg.message.content) {
           if (block.type === "tool_result" && block.tool_use_id) {
             const toolUse = pendingToolUses.get(block.tool_use_id);
+            console.log("[claude-events] tool_result:", {
+              tool_use_id: block.tool_use_id,
+              is_error: block.is_error,
+              toolUse: toolUse ? { name: toolUse.name, file_path: toolUse.input?.file_path } : "NOT_FOUND",
+            });
             if (
               toolUse &&
               !block.is_error &&
@@ -84,8 +159,13 @@ export function useClaudeEvents() {
               const filePath =
                 toolUse.input?.file_path || toolUse.input?.path;
               if (filePath) {
-                // Reload the file in the document store
-                useDocumentStore.getState().reloadFile(filePath);
+                registerProposedChange(filePath, block.tool_use_id!, toolUse.name);
+                // Track if any LaTeX-related files were modified
+                if (/\.(tex|bib|sty|cls|dtx)$/i.test(filePath)) {
+                  hasTexChanges = true;
+                }
+              } else {
+                console.warn("[claude-events] no file_path in tool input:", toolUse.input);
               }
             }
           }
@@ -105,8 +185,34 @@ export function useClaudeEvents() {
       chatStore._appendMessage(msg);
     }
 
-    function handleComplete(payload: boolean) {
+    async function handleComplete(payload: boolean) {
       useClaudeChatStore.getState()._setStreaming(false);
+      // Refresh file tree to pick up any files created/deleted during the session
+      const docStore = useDocumentStore.getState();
+      await docStore.refreshFiles();
+
+      // Auto-recompile if any LaTeX-related files were modified
+      if (hasTexChanges && docStore.projectRoot) {
+        const { projectRoot, files } = useDocumentStore.getState();
+        if (projectRoot) {
+          const mainFile = files.find(
+            (f) => f.name === "document.tex" || f.name === "main.tex",
+          );
+          const mainFileName = mainFile?.relativePath || "document.tex";
+          useDocumentStore.getState().setIsCompiling(true);
+          try {
+            const pdfData = await compileLatex(projectRoot, mainFileName);
+            useDocumentStore.getState().setPdfData(pdfData);
+          } catch (err) {
+            useDocumentStore.getState().setCompileError(
+              err instanceof Error ? err.message : "Compilation failed",
+            );
+          } finally {
+            useDocumentStore.getState().setIsCompiling(false);
+          }
+        }
+      }
+
       cleanupAll();
     }
 

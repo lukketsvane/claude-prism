@@ -12,10 +12,12 @@ import {
 import { join } from "@tauri-apps/api/path";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
+export type ProjectFileType = "tex" | "image" | "bib" | "style" | "other";
+
 export interface FsProjectFile {
   relativePath: string;
   absolutePath: string;
-  type: "tex" | "image" | "bib";
+  type: ProjectFileType;
 }
 
 const IMAGE_EXTENSIONS = new Set([
@@ -29,20 +31,65 @@ const IMAGE_EXTENSIONS = new Set([
   ".pdf",
 ]);
 
-function getFileType(name: string): "tex" | "image" | "bib" | null {
+const STYLE_EXTENSIONS = new Set([
+  ".sty",
+  ".cls",
+  ".bst",
+  ".def",
+  ".cfg",
+  ".fd",
+  ".dtx",
+  ".ins",
+]);
+
+const IGNORED_EXTENSIONS = new Set([
+  ".aux",
+  ".log",
+  ".out",
+  ".toc",
+  ".lof",
+  ".lot",
+  ".fls",
+  ".fdb_latexmk",
+  ".synctex.gz",
+  ".synctex",
+  ".blg",
+  ".bbl",
+  ".nav",
+  ".snm",
+  ".vrb",
+  ".run.xml",
+  ".bcf",
+]);
+
+function getFileType(name: string): ProjectFileType | null {
   const lower = name.toLowerCase();
-  if (lower.endsWith(".tex")) return "tex";
+  // Skip LaTeX build artifacts
+  for (const ext of IGNORED_EXTENSIONS) {
+    if (lower.endsWith(ext)) return null;
+  }
+  if (lower.endsWith(".tex") || lower.endsWith(".ltx")) return "tex";
   if (lower.endsWith(".bib")) return "bib";
   for (const ext of IMAGE_EXTENSIONS) {
     if (lower.endsWith(ext)) return "image";
   }
-  return null;
+  for (const ext of STYLE_EXTENSIONS) {
+    if (lower.endsWith(ext)) return "style";
+  }
+  // Show all other files (txt, md, sty downloaded packages, etc.)
+  return "other";
+}
+
+export interface ScanResult {
+  files: FsProjectFile[];
+  folders: string[]; // relative paths of all directories
 }
 
 export async function scanProjectFolder(
   rootPath: string,
-): Promise<FsProjectFile[]> {
-  const results: FsProjectFile[] = [];
+): Promise<ScanResult> {
+  const files: FsProjectFile[] = [];
+  const folders: string[] = [];
 
   async function walk(dir: string, prefix: string) {
     const entries = await readDir(dir);
@@ -55,11 +102,12 @@ export async function scanProjectFolder(
         if (entry.name.startsWith(".") || entry.name === "node_modules") {
           continue;
         }
+        folders.push(relativePath);
         await walk(entryPath, relativePath);
       } else {
         const type = getFileType(entry.name);
         if (type) {
-          results.push({
+          files.push({
             relativePath,
             absolutePath: entryPath,
             type,
@@ -70,7 +118,7 @@ export async function scanProjectFolder(
   }
 
   await walk(rootPath, "");
-  return results;
+  return { files, folders };
 }
 
 export async function readTexFileContent(
@@ -148,6 +196,10 @@ export async function renameFileOnDisk(
   newPath: string,
 ): Promise<void> {
   await rename(oldPath, newPath);
+}
+
+export async function createDirectory(absolutePath: string): Promise<void> {
+  await mkdir(absolutePath, { recursive: true });
 }
 
 export { exists, join };

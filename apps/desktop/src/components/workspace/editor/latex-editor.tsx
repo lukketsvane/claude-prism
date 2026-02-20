@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useMemo } from "react";
-import { EditorState, Prec } from "@codemirror/state";
+import { Compartment, EditorState, Prec, Transaction } from "@codemirror/state";
 import {
   EditorView,
   keymap,
@@ -12,10 +12,11 @@ import {
   defaultKeymap,
   history,
   historyKeymap,
-  insertNewlineAndIndent,
 } from "@codemirror/commands";
 import { syntaxHighlighting } from "@codemirror/language";
 import { oneDark, oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
+import { defaultHighlightStyle } from "@codemirror/language";
+import { useTheme } from "next-themes";
 import {
   search,
   highlightSelectionMatches,
@@ -24,90 +25,16 @@ import {
   findNext,
   findPrevious,
 } from "@codemirror/search";
+import { unifiedMergeView, getChunks, acceptChunk, rejectChunk } from "@codemirror/merge";
 import { latex } from "codemirror-lang-latex";
-import { useDocumentStore, type ProjectFile } from "@/stores/document-store";
+import { useDocumentStore } from "@/stores/document-store";
+import { useProposedChangesStore, type ProposedChange } from "@/stores/proposed-changes-store";
 import { compileLatex } from "@/lib/latex-compiler";
 import { EditorToolbar } from "./editor-toolbar";
 import { ClaudeChatDrawer } from "@/components/claude-chat/claude-chat-drawer";
+import { ProposedChangesPanel } from "@/components/claude-chat/proposed-changes-panel";
 import { ImagePreview } from "./image-preview";
 import { SearchPanel } from "./search-panel";
-
-interface StickyItem {
-  type: "section" | "begin";
-  name: string;
-  content: string;
-  html: string;
-  line: number;
-}
-
-interface ParsedLine {
-  type: "section" | "begin" | "end";
-  name: string;
-  content: string;
-  line: number;
-}
-
-function parseLatexStructure(content: string): ParsedLine[] {
-  const lines = content.split("\n");
-  const result: ParsedLine[] = [];
-
-  const sectionRegex =
-    /\\(part|chapter|section|subsection|subsubsection)\*?\s*\{[^}]*\}/;
-  const beginRegex = /\\begin\{([^}]+)\}/;
-  const endRegex = /\\end\{([^}]+)\}/;
-
-  lines.forEach((lineContent, index) => {
-    const sectionMatch = lineContent.match(sectionRegex);
-    if (sectionMatch) {
-      result.push({ type: "section", name: sectionMatch[1], content: lineContent, line: index + 1 });
-      return;
-    }
-    const beginMatch = lineContent.match(beginRegex);
-    if (beginMatch) {
-      result.push({ type: "begin", name: beginMatch[1], content: lineContent, line: index + 1 });
-      return;
-    }
-    const endMatch = lineContent.match(endRegex);
-    if (endMatch) {
-      result.push({ type: "end", name: endMatch[1], content: lineContent, line: index + 1 });
-    }
-  });
-
-  return result;
-}
-
-function getStickyLines(parsedLines: ParsedLine[], currentLine: number): StickyItem[] {
-  const stack: StickyItem[] = [];
-  const sectionLevelMap: Record<string, number> = {
-    part: 0, chapter: 1, section: 2, subsection: 3, subsubsection: 4,
-  };
-
-  for (const item of parsedLines) {
-    if (item.line > currentLine) break;
-    if (item.type === "section") {
-      const level = sectionLevelMap[item.name] ?? 2;
-      while (
-        stack.length > 0 &&
-        stack[stack.length - 1].type === "section" &&
-        sectionLevelMap[stack[stack.length - 1].name] >= level
-      ) {
-        stack.pop();
-      }
-      stack.push({ type: "section", name: item.name, content: item.content, html: "", line: item.line });
-    } else if (item.type === "begin") {
-      stack.push({ type: "begin", name: item.name, content: item.content, html: "", line: item.line });
-    } else if (item.type === "end") {
-      for (let i = stack.length - 1; i >= 0; i--) {
-        if (stack[i].type === "begin" && stack[i].name === item.name) {
-          stack.splice(i, 1);
-          break;
-        }
-      }
-    }
-  }
-
-  return stack;
-}
 
 function getActiveFileContent(): string {
   const state = useDocumentStore.getState();
@@ -134,32 +61,130 @@ export function LatexEditor() {
   const saveAllFiles = useDocumentStore((s) => s.saveAllFiles);
 
   const activeFile = files.find((f) => f.id === activeFileId);
-  const isTexFile = activeFile?.type === "tex";
+  const isTextFile = activeFile?.type === "tex" || activeFile?.type === "bib" || activeFile?.type === "style" || activeFile?.type === "other";
   const activeFileContent = activeFile?.content;
 
   const [imageScale, setImageScale] = useState(0.5);
-  const [currentLine, setCurrentLine] = useState(1);
-  const [gutterWidth, setGutterWidth] = useState(0);
-  const [lineHtmlCache, setLineHtmlCache] = useState<Record<number, string>>({});
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [matchCount, setMatchCount] = useState(0);
   const [currentMatch, setCurrentMatch] = useState(0);
+  const [mergeChunkInfo, setMergeChunkInfo] = useState({ total: 0, current: 0 });
 
-  const parsedLines = useMemo(
-    () => parseLatexStructure(activeFileContent ?? ""),
-    [activeFileContent],
-  );
-
-  const stickyLines = useMemo(() => {
-    const items = getStickyLines(parsedLines, currentLine);
-    return items.map((item) => ({ ...item, html: lineHtmlCache[item.line] || "" }));
-  }, [parsedLines, currentLine, lineHtmlCache]);
+  const { resolvedTheme } = useTheme();
 
   const compileRef = useRef<() => void>(() => {});
   const isSearchOpenRef = useRef(false);
+  const themeCompartmentRef = useRef(new Compartment());
+  const mergeCompartmentRef = useRef(new Compartment());
+  const isMergeActiveRef = useRef(false);
+  const pendingChangeRef = useRef<ProposedChange | null>(null);
+  const handleKeepAllRef = useRef<() => void>(() => {});
+  const handleUndoAllRef = useRef<() => void>(() => {});
 
   useEffect(() => { isSearchOpenRef.current = isSearchOpen; }, [isSearchOpen]);
+
+  // Proposed changes for active file
+  const proposedChanges = useProposedChangesStore((s) => s.changes);
+  const activeFileChange = useMemo(() => {
+    if (!activeFile) return null;
+    return proposedChanges.find((c) => c.filePath === activeFile.relativePath) ?? null;
+  }, [proposedChanges, activeFile]);
+
+  // Keep all changes (⌘Y)
+  handleKeepAllRef.current = () => {
+    const view = viewRef.current;
+    const change = pendingChangeRef.current;
+    if (!view || !change) return;
+    isMergeActiveRef.current = false;
+    setMergeChunkInfo({ total: 0, current: 0 });
+    view.dispatch({ effects: mergeCompartmentRef.current.reconfigure([]) });
+    setContent(change.newContent);
+    useProposedChangesStore.getState().keepChange(change.id);
+    pendingChangeRef.current = null;
+  };
+
+  // Undo all changes (⌘N)
+  handleUndoAllRef.current = () => {
+    const view = viewRef.current;
+    const change = pendingChangeRef.current;
+    if (!view || !change) return;
+    isMergeActiveRef.current = false;
+    setMergeChunkInfo({ total: 0, current: 0 });
+    view.dispatch({ effects: mergeCompartmentRef.current.reconfigure([]) });
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: change.oldContent },
+      annotations: Transaction.addToHistory.of(false),
+    });
+    setContent(change.oldContent);
+    useProposedChangesStore.getState().undoChange(change.id);
+    pendingChangeRef.current = null;
+  };
+
+  // Navigate to a specific chunk by index
+  const goToChunk = (index: number) => {
+    const view = viewRef.current;
+    if (!view) return;
+    const chunks = getChunks(view.state);
+    if (!chunks || index < 0 || index >= chunks.chunks.length) return;
+    const chunk = chunks.chunks[index];
+    view.dispatch({
+      selection: { anchor: chunk.fromB },
+      effects: EditorView.scrollIntoView(chunk.fromB, { y: "center" }),
+    });
+    view.focus();
+  };
+
+  // After individual accept/reject, navigate to next chunk or auto-resolve
+  const afterChunkAction = (view: EditorView, prevIdx: number) => {
+    const remaining = getChunks(view.state);
+    if (!remaining || remaining.chunks.length === 0) {
+      // All chunks resolved — clean up merge view
+      const change = pendingChangeRef.current;
+      if (change) {
+        isMergeActiveRef.current = false;
+        setMergeChunkInfo({ total: 0, current: 0 });
+        const finalContent = view.state.doc.toString();
+        view.dispatch({ effects: mergeCompartmentRef.current.reconfigure([]) });
+        setContent(finalContent);
+        if (finalContent === change.oldContent) {
+          useProposedChangesStore.getState().undoChange(change.id);
+        } else {
+          useProposedChangesStore.getState().keepChange(change.id);
+        }
+        pendingChangeRef.current = null;
+      }
+    } else {
+      // Focus the next remaining chunk
+      const nextIdx = Math.min(prevIdx, remaining.chunks.length - 1);
+      const next = remaining.chunks[nextIdx];
+      view.dispatch({
+        selection: { anchor: next.fromB },
+        effects: EditorView.scrollIntoView(next.fromB, { y: "center" }),
+      });
+    }
+    view.focus();
+  };
+
+  const acceptCurrentChunk = () => {
+    const view = viewRef.current;
+    if (!view) return;
+    const chunks = getChunks(view.state);
+    const idx = mergeChunkInfo.current - 1;
+    if (!chunks || idx < 0 || idx >= chunks.chunks.length) return;
+    acceptChunk(view, chunks.chunks[idx].fromB);
+    afterChunkAction(view, idx);
+  };
+
+  const rejectCurrentChunk = () => {
+    const view = viewRef.current;
+    if (!view) return;
+    const chunks = getChunks(view.state);
+    const idx = mergeChunkInfo.current - 1;
+    if (!chunks || idx < 0 || idx >= chunks.chunks.length) return;
+    rejectChunk(view, chunks.chunks[idx].fromB);
+    afterChunkAction(view, idx);
+  };
 
   useEffect(() => {
     if (!searchQuery || !activeFileContent) { setMatchCount(0); setCurrentMatch(0); return; }
@@ -194,10 +219,8 @@ export function LatexEditor() {
     setIsCompiling(true);
     try {
       await saveAllFiles();
-      // Determine main file
-      const mainFile = files.find((f) => f.name === "document.tex" || f.name === "main.tex");
-      const mainFileName = mainFile?.relativePath || "document.tex";
-      const data = await compileLatex(projectRoot, mainFileName);
+      const targetFile = activeFile?.relativePath || "document.tex";
+      const data = await compileLatex(projectRoot, targetFile);
       setPdfData(data);
     } catch (error) {
       setCompileError(error instanceof Error ? error.message : "Compilation failed");
@@ -207,10 +230,48 @@ export function LatexEditor() {
   };
 
   useEffect(() => {
-    if (!containerRef.current || !isTexFile) return;
+    if (!containerRef.current || !isTextFile) return;
     const currentContent = getActiveFileContent();
 
     const updateListener = EditorView.updateListener.of((update) => {
+      if (isMergeActiveRef.current) {
+        const chunks = getChunks(update.state);
+        if (chunks) {
+          const total = chunks.chunks.length;
+          // Track current chunk based on cursor position
+          const cursorPos = update.state.selection.main.head;
+          let current = 0;
+          for (let i = 0; i < chunks.chunks.length; i++) {
+            if (cursorPos >= chunks.chunks[i].fromB) current = i + 1;
+          }
+          setMergeChunkInfo({ total, current: Math.min(Math.max(1, current), total) });
+
+          // Auto-resolve when all chunks have been individually accepted/rejected
+          // Note: acceptChunk doesn't change the main doc (only the original),
+          // so we check total === 0 regardless of docChanged
+          if (total === 0) {
+            const change = pendingChangeRef.current;
+            if (change) {
+              setTimeout(() => {
+                const v = viewRef.current;
+                if (!v || !isMergeActiveRef.current) return;
+                isMergeActiveRef.current = false;
+                setMergeChunkInfo({ total: 0, current: 0 });
+                const finalContent = v.state.doc.toString();
+                v.dispatch({ effects: mergeCompartmentRef.current.reconfigure([]) });
+                setContent(finalContent);
+                if (finalContent === change.oldContent) {
+                  useProposedChangesStore.getState().undoChange(change.id);
+                } else {
+                  useProposedChangesStore.getState().keepChange(change.id);
+                }
+                pendingChangeRef.current = null;
+              }, 0);
+            }
+          }
+        }
+        return;
+      }
       if (update.docChanged) setContent(update.state.doc.toString());
       if (update.selectionSet) {
         const { from, to, head } = update.state.selection.main;
@@ -219,40 +280,13 @@ export function LatexEditor() {
       }
     });
 
-    const scrollListener = EditorView.domEventHandlers({
-      scroll: (_, view) => {
-        const scrollTop = view.scrollDOM.scrollTop;
-        const lineBlock = view.lineBlockAtHeight(scrollTop);
-        const lineNumber = view.state.doc.lineAt(lineBlock.from).number;
-        setCurrentLine(lineNumber);
-        const gutter = view.dom.querySelector(".cm-gutters");
-        if (gutter) setGutterWidth(gutter.getBoundingClientRect().width);
-        const cmLines = view.dom.querySelectorAll(".cm-line");
-        const newCache: Record<number, string> = {};
-        cmLines.forEach((el) => {
-          const lineInfo = view.lineBlockAt(view.posAtDOM(el as HTMLElement, 0));
-          const ln = view.state.doc.lineAt(lineInfo.from).number;
-          newCache[ln] = el.innerHTML;
-        });
-        setLineHtmlCache((prev) => ({ ...prev, ...newCache }));
-      },
-    });
-
     const compileKeymap = Prec.highest(
       keymap.of([
         {
-          key: "Enter",
-          run: (view) => {
-            if (isSearchOpenRef.current) { findNext(view); return true; }
+          key: "Mod-Enter",
+          run: () => {
             compileRef.current();
             return true;
-          },
-        },
-        {
-          key: "Shift-Enter",
-          run: (view) => {
-            if (isSearchOpenRef.current) { findPrevious(view); return true; }
-            return insertNewlineAndIndent(view);
           },
         },
         {
@@ -266,6 +300,8 @@ export function LatexEditor() {
         },
         { key: "Mod-f", run: () => { setIsSearchOpen(true); return true; } },
         { key: "Escape", run: () => { if (isSearchOpenRef.current) { setIsSearchOpen(false); return true; } return false; } },
+        { key: "Mod-y", run: () => { if (isMergeActiveRef.current) { handleKeepAllRef.current(); return true; } return false; } },
+        { key: "Mod-n", run: () => { if (isMergeActiveRef.current) { handleUndoAllRef.current(); return true; } return false; } },
       ]),
     );
 
@@ -279,12 +315,15 @@ export function LatexEditor() {
         history(),
         keymap.of([...defaultKeymap, ...historyKeymap]),
         latex(),
-        oneDark,
-        syntaxHighlighting(oneDarkHighlightStyle),
+        themeCompartmentRef.current.of(
+          resolvedTheme === "dark"
+            ? [oneDark, syntaxHighlighting(oneDarkHighlightStyle)]
+            : [syntaxHighlighting(defaultHighlightStyle)]
+        ),
         search(),
         highlightSelectionMatches(),
+        mergeCompartmentRef.current.of([]),
         updateListener,
-        scrollListener,
         EditorView.lineWrapping,
         scrollPastEnd(),
         EditorView.theme({
@@ -296,6 +335,27 @@ export function LatexEditor() {
           ".cm-searchMatch": { backgroundColor: "#facc15 !important", color: "#000 !important", borderRadius: "2px", boxShadow: "0 0 0 1px #eab308" },
           ".cm-searchMatch-selected": { backgroundColor: "#f97316 !important", color: "#fff !important", borderRadius: "2px", boxShadow: "0 0 0 2px #ea580c" },
           "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": { backgroundColor: "rgba(100, 150, 255, 0.3)" },
+          ".cm-changedLine": { backgroundColor: "rgba(34, 197, 94, 0.08) !important" },
+          ".cm-deletedChunk": { backgroundColor: "rgba(239, 68, 68, 0.12) !important", paddingLeft: "6px", position: "relative" },
+          ".cm-insertedLine": { backgroundColor: "rgba(34, 197, 94, 0.15) !important" },
+          ".cm-deletedLine": { backgroundColor: "rgba(239, 68, 68, 0.15) !important" },
+          ".cm-changedText": { backgroundColor: "rgba(34, 197, 94, 0.25) !important" },
+          ".cm-chunkButtons": { position: "absolute", insetInlineEnd: "5px", top: "2px", zIndex: "10" },
+          ".cm-chunkButtons button": {
+            border: "none",
+            cursor: "pointer",
+            color: "white",
+            margin: "0 2px",
+            borderRadius: "3px",
+            padding: "2px 8px",
+            fontSize: "12px",
+            lineHeight: "1.4",
+          },
+          ".cm-chunkButtons button[name=accept]": { backgroundColor: "#22c55e" },
+          ".cm-chunkButtons button[name=reject]": { backgroundColor: "#ef4444" },
+          ".cm-changeGutter": { width: "3px", minWidth: "3px" },
+          ".cm-changedLineGutter": { backgroundColor: "#22c55e" },
+          ".cm-deletedLineGutter": { backgroundColor: "#ef4444" },
         }),
       ],
     });
@@ -303,17 +363,72 @@ export function LatexEditor() {
     const view = new EditorView({ state, parent: containerRef.current });
     viewRef.current = view;
     return () => { view.destroy(); viewRef.current = null; };
-  }, [activeFileId, isTexFile, setContent, setCursorPosition, setSelectionRange]);
+  }, [activeFileId, isTextFile, setContent, setCursorPosition, setSelectionRange]);
+
+  // Dynamically switch editor theme when resolvedTheme changes
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const extensions =
+      resolvedTheme === "dark"
+        ? [oneDark, syntaxHighlighting(oneDarkHighlightStyle)]
+        : [syntaxHighlighting(defaultHighlightStyle)];
+    view.dispatch({ effects: themeCompartmentRef.current.reconfigure(extensions) });
+  }, [resolvedTheme]);
 
   useEffect(() => {
     const view = viewRef.current;
-    if (!view || !isTexFile) return;
+    if (!view || !isTextFile || isMergeActiveRef.current) return;
     const content = activeFileContent ?? "";
     const currentContent = view.state.doc.toString();
     if (currentContent !== content) {
       view.dispatch({ changes: { from: 0, to: currentContent.length, insert: content } });
     }
-  }, [activeFileContent, isTexFile]);
+  }, [activeFileContent, isTextFile]);
+
+  // Watch for proposed changes → activate/deactivate merge view
+  useEffect(() => {
+    const view = viewRef.current;
+    console.log("[merge-view] effect fired:", {
+      hasView: !!view,
+      isTextFile,
+      activeFileChange: activeFileChange ? { id: activeFileChange.id, filePath: activeFileChange.filePath } : null,
+      isMergeActive: isMergeActiveRef.current,
+    });
+    if (!view || !isTextFile) return;
+
+    if (activeFileChange && !isMergeActiveRef.current) {
+      // Activate merge view: load newContent + enable merge extension in ONE atomic dispatch
+      console.log("[merge-view] ACTIVATING merge view for:", activeFileChange.filePath);
+      pendingChangeRef.current = activeFileChange;
+      isMergeActiveRef.current = true;
+      try {
+        view.dispatch({
+          changes: { from: 0, to: view.state.doc.length, insert: activeFileChange.newContent },
+          effects: mergeCompartmentRef.current.reconfigure(
+            unifiedMergeView({
+              original: activeFileChange.oldContent,
+              highlightChanges: true,
+              gutter: true,
+              mergeControls: true,
+            })
+          ),
+          annotations: Transaction.addToHistory.of(false),
+        });
+        console.log("[merge-view] merge view activated successfully");
+      } catch (err) {
+        console.error("[merge-view] failed to activate merge view:", err);
+        isMergeActiveRef.current = false;
+        pendingChangeRef.current = null;
+      }
+    } else if (!activeFileChange && isMergeActiveRef.current) {
+      // Deactivate merge view (externally resolved)
+      console.log("[merge-view] DEACTIVATING merge view");
+      view.dispatch({ effects: mergeCompartmentRef.current.reconfigure([]) });
+      isMergeActiveRef.current = false;
+      pendingChangeRef.current = null;
+    }
+  }, [activeFileChange, isTextFile]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -326,7 +441,7 @@ export function LatexEditor() {
     clearJumpRequest();
   }, [jumpToPosition, clearJumpRequest]);
 
-  if (!isTexFile && activeFile) {
+  if (!isTextFile && activeFile) {
     return (
       <div className="flex h-full flex-col bg-background">
         <EditorToolbar editorView={viewRef} fileType="image" imageScale={imageScale} onImageScaleChange={setImageScale} />
@@ -353,35 +468,56 @@ export function LatexEditor() {
         />
       )}
       <div className="relative min-h-0 flex-1 overflow-hidden">
-        {stickyLines.length > 0 && (
-          <div className="absolute inset-x-0 top-0 z-10 border-border border-b bg-[#282c34] font-mono text-[14px] leading-[1.4] shadow-md">
-            {stickyLines.map((section) => (
-              <div
-                key={section.line}
-                className="flex cursor-pointer items-center hover:bg-white/5"
-                onClick={() => {
-                  const view = viewRef.current;
-                  if (!view) return;
-                  const line = view.state.doc.line(section.line);
-                  view.dispatch({ selection: { anchor: line.from }, effects: EditorView.scrollIntoView(line.from, { y: "start" }) });
-                  view.focus();
-                }}
-              >
-                <span className="shrink-0 bg-[#282c34] py-px text-right text-[#636d83]" style={{ width: gutterWidth ? gutterWidth - 8 : 32 }}>
-                  {section.line}
-                </span>
-                {section.html ? (
-                  <span className="py-px pl-5.5" dangerouslySetInnerHTML={{ __html: section.html }} />
-                ) : (
-                  <span className="py-px pl-5.5 text-[#abb2bf]">{section.content}</span>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
         <div ref={containerRef} className="absolute inset-0" />
         <ClaudeChatDrawer />
+        {/* Floating chunk navigator pill */}
+        {activeFileChange && mergeChunkInfo.total > 0 && (
+          <div className="absolute top-3 right-3 z-20 flex items-center gap-1 rounded-lg border border-border bg-background/95 px-2 py-1 shadow-lg backdrop-blur-sm">
+            <span className="px-1 font-mono text-xs text-muted-foreground">
+              ±&nbsp;{mergeChunkInfo.current}/{mergeChunkInfo.total}
+            </span>
+            <div className="mx-0.5 h-4 w-px bg-border" />
+            <button
+              onClick={() => goToChunk(mergeChunkInfo.current - 2)}
+              disabled={mergeChunkInfo.current <= 1}
+              className="rounded p-0.5 text-muted-foreground hover:bg-white/10 hover:text-foreground disabled:opacity-30 disabled:cursor-default transition-colors"
+              title="Previous change"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
+            </button>
+            <button
+              onClick={() => goToChunk(mergeChunkInfo.current)}
+              disabled={mergeChunkInfo.current >= mergeChunkInfo.total}
+              className="rounded p-0.5 text-muted-foreground hover:bg-white/10 hover:text-foreground disabled:opacity-30 disabled:cursor-default transition-colors"
+              title="Next change"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <div className="mx-0.5 h-4 w-px bg-border" />
+            <button
+              onClick={acceptCurrentChunk}
+              className="rounded p-0.5 text-green-400 hover:bg-green-600/20 transition-colors"
+              title="Accept this change"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            </button>
+            <button
+              onClick={rejectCurrentChunk}
+              className="rounded p-0.5 text-red-400 hover:bg-red-600/20 transition-colors"
+              title="Reject this change"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+          </div>
+        )}
       </div>
+      {activeFileChange && (
+        <ProposedChangesPanel
+          change={activeFileChange}
+          onKeep={() => handleKeepAllRef.current()}
+          onUndo={() => handleUndoAllRef.current()}
+        />
+      )}
     </div>
   );
 }

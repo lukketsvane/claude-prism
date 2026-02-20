@@ -17,7 +17,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { compileLatex } from "@/lib/latex-compiler";
+import { compileLatex, synctexEdit } from "@/lib/latex-compiler";
 
 const ZOOM_OPTIONS = [
   { value: "0.5", label: "50%" },
@@ -46,6 +46,7 @@ export function PdfPreview() {
   const projectRoot = useDocumentStore((s) => s.projectRoot);
   const files = useDocumentStore((s) => s.files);
   const saveAllFiles = useDocumentStore((s) => s.saveAllFiles);
+  const setActiveFile = useDocumentStore((s) => s.setActiveFile);
   const requestJumpToPosition = useDocumentStore(
     (s) => s.requestJumpToPosition,
   );
@@ -73,6 +74,58 @@ export function PdfPreview() {
       if (index !== -1) requestJumpToPosition(index);
     },
     [content, requestJumpToPosition],
+  );
+
+  const handleSynctexClick = useCallback(
+    async (page: number, x: number, y: number) => {
+      if (!projectRoot) {
+        console.log("[synctex] no projectRoot");
+        return;
+      }
+      console.log("[synctex] calling synctexEdit:", { projectRoot, page, x: x.toFixed(1), y: y.toFixed(1) });
+      const result = await synctexEdit(projectRoot, page, x, y);
+      console.log("[synctex] result:", result);
+      if (!result) return;
+
+      // Find the file by relative path (try exact match, then normalized match)
+      const normalize = (p: string) => p.replace(/\\/g, "/").replace(/^\.\//, "");
+      const normalizedTarget = normalize(result.file);
+      const targetFile = files.find(
+        (f) => normalize(f.relativePath) === normalizedTarget,
+      );
+      if (!targetFile) {
+        console.log("[synctex] file not found in project:", result.file, "available:", files.map(f => f.relativePath));
+        return;
+      }
+
+      // Switch to the file if not already active
+      const state = useDocumentStore.getState();
+      const needsSwitch = state.activeFileId !== targetFile.id;
+      if (needsSwitch) {
+        setActiveFile(targetFile.id);
+      }
+
+      // Compute character offset from line number (1-based → 0-based offset)
+      const fileContent = targetFile.content ?? "";
+      const fileLines = fileContent.split("\n");
+      const targetLine = Math.max(1, Math.min(result.line, fileLines.length));
+      let offset = 0;
+      for (let i = 0; i < targetLine - 1; i++) {
+        offset += fileLines[i].length + 1; // +1 for \n
+      }
+      // Column might be 0 or -1 from synctex; just go to line start in that case
+      if (result.column > 0) {
+        offset += Math.min(result.column, fileLines[targetLine - 1]?.length ?? 0);
+      }
+
+      // Delay jump if file was switched so the editor has time to initialize
+      if (needsSwitch) {
+        setTimeout(() => requestJumpToPosition(offset), 100);
+      } else {
+        requestJumpToPosition(offset);
+      }
+    },
+    [projectRoot, files, setActiveFile, requestJumpToPosition],
   );
 
   useEffect(() => {
@@ -180,6 +233,7 @@ export function PdfPreview() {
           onLoadSuccess={handleLoadSuccess}
           onScaleChange={handleScaleChange}
           onTextClick={handleTextClick}
+          onSynctexClick={handleSynctexClick}
         />
       </Suspense>
     );

@@ -26,9 +26,23 @@ export const ChatMessages: FC = () => {
 
   // Filter displayable messages
   const displayMessages = useMemo(() => {
+    // Collect all assistant text for dedup against result
+    const assistantTexts = new Set<string>();
+    for (const msg of messages) {
+      if (msg.type === "assistant" && msg.message?.content) {
+        for (const block of msg.message.content) {
+          if (block.type === "text" && block.text) {
+            assistantTexts.add(block.text.trim());
+          }
+        }
+      }
+    }
+
     return messages.filter((msg) => {
-      // Skip system:init (rendered as a subtle header if needed)
+      // Skip system:init
       if (msg.type === "system" && msg.subtype === "init") return false;
+      // Skip non-displayable event types (rate_limit_event, etc.)
+      if (msg.type !== "user" && msg.type !== "assistant" && msg.type !== "result") return false;
       // Skip user messages that only contain tool_results
       if (msg.type === "user" && msg.message?.content) {
         const hasOnlyToolResults = msg.message.content.every(
@@ -36,16 +50,20 @@ export const ChatMessages: FC = () => {
         );
         if (hasOnlyToolResults) return false;
       }
+      // Skip result message if its text duplicates an assistant message
+      if (msg.type === "result" && msg.result) {
+        if (assistantTexts.has(msg.result.trim())) return false;
+      }
       return true;
     });
   }, [messages]);
 
-  // Auto-scroll to bottom on new messages
+  // Auto-scroll to bottom on new messages or message updates
   useEffect(() => {
     if (viewportRef.current) {
       viewportRef.current.scrollTop = viewportRef.current.scrollHeight;
     }
-  }, [displayMessages.length]);
+  }, [displayMessages]);
 
   return (
     <div
@@ -86,6 +104,12 @@ const MessageBubble: FC<{
   message: ClaudeStreamMessage;
   toolResultMap: Map<string, ContentBlock>;
 }> = ({ message, toolResultMap }) => {
+  console.log(
+    `[chat-msg] type=${message.type} subtype=${message.subtype ?? ""} ` +
+    `contentTypes=[${message.message?.content?.map((b) => b.type).join(",") ?? "none"}] ` +
+    `result=${message.result ? `"${message.result.slice(0, 60)}"` : "none"}`
+  );
+
   if (message.type === "user") {
     return <UserMessage message={message} />;
   }
@@ -126,6 +150,20 @@ const AssistantMessage: FC<{
   const content = message.message?.content;
   if (!content || content.length === 0) return null;
 
+  // Check if any content block would actually render
+  const hasRenderableContent = content.some(
+    (block) =>
+      (block.type === "text" && block.text) ||
+      (block.type === "tool_use" && block.id)
+  );
+
+  if (!hasRenderableContent) {
+    console.log("[chat-msg] AssistantMessage skipped — no renderable content:",
+      content.map((b) => ({ type: b.type, hasText: !!b.text, hasId: !!b.id }))
+    );
+    return null;
+  }
+
   return (
     <div className="w-full py-1.5">
       <div className="px-1 text-foreground text-sm leading-relaxed">
@@ -165,16 +203,23 @@ const ResultMessage: FC<{ message: ClaudeStreamMessage }> = ({ message }) => {
   if (!resultText) return null;
 
   return (
-    <div className="my-2 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-      {isError ? (
-        <span className="text-destructive">{resultText}</span>
-      ) : (
-        <span>{resultText}</span>
-      )}
-      {message.cost_usd && (
-        <span className="ml-2">
+    <div className="w-full py-1.5">
+      <div className="px-1 text-foreground text-sm leading-relaxed">
+        {isError ? (
+          <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive text-sm">
+            {resultText}
+          </div>
+        ) : (
+          <MarkdownRenderer
+            content={resultText}
+            className="prose prose-sm dark:prose-invert max-w-none"
+          />
+        )}
+      </div>
+      {message.cost_usd != null && (
+        <div className="mt-1 px-1 text-right text-muted-foreground text-xs">
           Cost: ${message.cost_usd.toFixed(4)}
-        </span>
+        </div>
       )}
     </div>
   );

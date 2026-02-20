@@ -59,39 +59,6 @@ interface ClaudeChatState {
   _setError: (error: string | null) => void;
 }
 
-// ─── Helpers ───
-
-function buildPromptWithContext(userPrompt: string): string {
-  const docState = useDocumentStore.getState();
-  const activeFile = docState.files.find(
-    (f) => f.id === docState.activeFileId
-  );
-  if (!activeFile || !activeFile.content) {
-    return userPrompt;
-  }
-
-  const fileName = activeFile.name;
-  const content = activeFile.content;
-  const selRange = docState.selectionRange;
-  const selectedText =
-    selRange ? content.slice(selRange.start, selRange.end) : null;
-
-  let contextBlock = `You are a LaTeX writing assistant integrated into the Open-Prism editor.\n\n`;
-  contextBlock += `## Current Document: ${fileName}\n`;
-  contextBlock += `\`\`\`latex\n${content}\n\`\`\`\n\n`;
-
-  if (selectedText) {
-    contextBlock += `## Selected Text\n\`\`\`\n${selectedText}\n\`\`\`\n\n`;
-  }
-
-  contextBlock += `## Instructions\n`;
-  contextBlock += `When modifying the document, use your Edit or Write tools directly on the .tex files.\n`;
-  contextBlock += `When providing LaTeX suggestions, use \`\`\`latex code blocks.\n\n`;
-  contextBlock += `## User Request\n${userPrompt}`;
-
-  return contextBlock;
-}
-
 // ─── Store ───
 
 export const useClaudeChatStore = create<ClaudeChatState>()((set, get) => ({
@@ -127,7 +94,26 @@ export const useClaudeChatStore = create<ClaudeChatState>()((set, get) => ({
       error: null,
     }));
 
-    const prompt = buildPromptWithContext(userPrompt);
+    // Flush unsaved edits to disk so Claude reads the latest content
+    if (docState.files.some((f) => f.isDirty)) {
+      await docState.saveAllFiles();
+    }
+
+    // Add context about the currently focused file
+    const activeFile = docState.files.find((f) => f.id === docState.activeFileId);
+    let prompt = userPrompt;
+    if (activeFile) {
+      const selRange = docState.selectionRange;
+      const selectedText =
+        selRange && activeFile.content
+          ? activeFile.content.slice(selRange.start, selRange.end)
+          : null;
+      let ctx = `[Currently open file: ${activeFile.relativePath}]`;
+      if (selectedText) {
+        ctx += `\n[Selected text:\n${selectedText}\n]`;
+      }
+      prompt = `${ctx}\n\n${userPrompt}`;
+    }
     const model = "sonnet";
 
     try {
