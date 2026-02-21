@@ -4,14 +4,17 @@ import {
   readTexFileContent,
   writeTexFileContent,
   readImageAsDataUrl,
+  getAssetUrl,
   createFileOnDisk,
   copyFileToProject,
   deleteFileFromDisk,
   renameFileOnDisk,
+  getUniqueTargetName,
   createDirectory,
   join,
   type ProjectFileType,
 } from "@/lib/tauri/fs";
+import { useHistoryStore } from "@/stores/history-store";
 
 export interface ProjectFile {
   id: string; // relativePath is the id
@@ -64,7 +67,9 @@ interface DocumentState {
   saveCurrentFile: () => Promise<void>;
   createNewFile: (name: string, type: "tex" | "image", folder?: string) => Promise<void>;
   createFolder: (name: string, parentFolder?: string) => Promise<void>;
-  importFiles: (sourcePaths: string[], targetFolder?: string) => Promise<void>;
+  importFiles: (sourcePaths: string[], targetFolder?: string) => Promise<string[]>;
+  moveFile: (fileId: string, targetFolder: string | null) => Promise<void>;
+  moveFolder: (folderPath: string, targetFolder: string | null) => Promise<void>;
   reloadFile: (relativePath: string) => Promise<void>;
   refreshFiles: () => Promise<void>;
 
@@ -141,6 +146,11 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
         } catch {
           // Image loading failed, that's ok
         }
+      }
+
+      // Load asset URL for PDF files
+      if (f.type === "pdf") {
+        pf.dataUrl = getAssetUrl(f.absolutePath);
       }
 
       projectFiles.push(pf);
@@ -260,7 +270,7 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
   insertAtCursor: (text) => {
     const state = get();
     const activeFile = getActiveFile(state);
-    if (!activeFile || (activeFile.type === "image"))
+    if (!activeFile || (activeFile.type === "image" || activeFile.type === "pdf"))
       return;
 
     const content = activeFile.content ?? "";
@@ -281,7 +291,7 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
   replaceSelection: (start, end, text) => {
     const state = get();
     const activeFile = getActiveFile(state);
-    if (!activeFile || (activeFile.type === "image"))
+    if (!activeFile || (activeFile.type === "image" || activeFile.type === "pdf"))
       return;
 
     const content = activeFile.content ?? "";
@@ -300,7 +310,7 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
   findAndReplace: (find, replace) => {
     const state = get();
     const activeFile = getActiveFile(state);
-    if (!activeFile || (activeFile.type === "image"))
+    if (!activeFile || (activeFile.type === "image" || activeFile.type === "pdf"))
       return false;
 
     const content = activeFile.content ?? "";
@@ -346,6 +356,14 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
   saveCurrentFile: async () => {
     const state = get();
     await state.saveFile(state.activeFileId);
+    // Manual save → immediate snapshot
+    if (state.projectRoot) {
+      try {
+        await useHistoryStore.getState().createSnapshot(state.projectRoot, "[manual] Save");
+      } catch {
+        // Snapshot failure should not break save
+      }
+    }
   },
 
   createNewFile: async (name, type, folder) => {
@@ -391,14 +409,60 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
 
   importFiles: async (sourcePaths, targetFolder) => {
     const state = get();
-    if (!state.projectRoot) return;
+    if (!state.projectRoot) return [];
 
+    const importedPaths: string[] = [];
     for (const sourcePath of sourcePaths) {
       const fileName = sourcePath.split("/").pop() || sourcePath;
       const targetName = targetFolder ? `${targetFolder}/${fileName}` : fileName;
-      await copyFileToProject(state.projectRoot, sourcePath, targetName);
+      // copyFileToProject returns the actual (possibly deduplicated) relative path
+      const actualName = await copyFileToProject(state.projectRoot, sourcePath, targetName);
+      importedPaths.push(actualName);
     }
     await state.refreshFiles();
+    return importedPaths;
+  },
+
+  moveFile: async (fileId, targetFolder) => {
+    const state = get();
+    const file = state.files.find((f) => f.id === fileId);
+    if (!file || !state.projectRoot) return;
+
+    const desiredPath = targetFolder ? `${targetFolder}/${file.name}` : file.name;
+    if (desiredPath === file.relativePath) return;
+
+    // Auto-deduplicate if a file with the same name exists in the target
+    const newRelativePath = await getUniqueTargetName(state.projectRoot, desiredPath);
+    const newAbsPath = await join(state.projectRoot, newRelativePath);
+    await renameFileOnDisk(file.absolutePath, newAbsPath);
+
+    const newName = newRelativePath.split("/").pop() || file.name;
+    set((s) => ({
+      files: s.files.map((f) =>
+        f.id === fileId
+          ? { ...f, name: newName, relativePath: newRelativePath, absolutePath: newAbsPath, id: newRelativePath }
+          : f,
+      ),
+      activeFileId: s.activeFileId === fileId ? newRelativePath : s.activeFileId,
+    }));
+  },
+
+  moveFolder: async (folderPath, targetFolder) => {
+    const state = get();
+    if (!state.projectRoot) return;
+
+    const folderName = folderPath.split("/").pop()!;
+    const newFolderPath = targetFolder ? `${targetFolder}/${folderName}` : folderName;
+    if (newFolderPath === folderPath) return;
+    // Prevent moving a folder into itself
+    if (newFolderPath.startsWith(folderPath + "/")) return;
+
+    const oldAbsPath = await join(state.projectRoot, folderPath);
+    const newAbsPath = await join(state.projectRoot, newFolderPath);
+    await renameFileOnDisk(oldAbsPath, newAbsPath);
+
+    // Reload project to pick up all new paths
+    await state.openProject(state.projectRoot);
   },
 
   reloadFile: async (relativePath) => {
@@ -444,6 +508,8 @@ export const useDocumentStore = create<DocumentState>()((set, get) => ({
           try {
             pf.dataUrl = await readImageAsDataUrl(pf.absolutePath);
           } catch { /* skip unreadable */ }
+        } else if (pf.type === "pdf") {
+          pf.dataUrl = getAssetUrl(pf.absolutePath);
         }
         newFiles.push(pf);
       }

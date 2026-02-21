@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import {
   FileTextIcon,
   FolderIcon,
@@ -19,12 +19,26 @@ import {
   ChevronDownIcon,
   FileCodeIcon,
   FileIcon,
+  FileSpreadsheetIcon,
+  GripVerticalIcon,
 } from "lucide-react";
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  useDroppable,
+  useDraggable,
+  type DragStartEvent,
+  type DragEndEvent,
+} from "@dnd-kit/core";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { useTheme } from "next-themes";
 import { useDocumentStore, type ProjectFile } from "@/stores/document-store";
 import { cn } from "@/lib/utils";
 import { ZoteroPanel, ZoteroHeader } from "@/components/workspace/zotero-panel";
+import { HistoryPanel, HistoryHeader } from "@/components/workspace/history-panel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -49,6 +63,7 @@ import {
 } from "@/components/ui/context-menu";
 import { Input } from "@/components/ui/input";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 // ─── Table of Contents ───
 
@@ -153,6 +168,7 @@ function buildFileTree(files: ProjectFile[], folders: string[]): TreeNode[] {
 
 function getFileIcon(file: ProjectFile) {
   if (file.type === "image") return <ImageIcon className="size-4 shrink-0" />;
+  if (file.type === "pdf") return <FileSpreadsheetIcon className="size-4 shrink-0" />;
   if (file.type === "style") return <FileCodeIcon className="size-4 shrink-0" />;
   if (file.type === "other") return <FileIcon className="size-4 shrink-0" />;
   return <FileTextIcon className="size-4 shrink-0" />;
@@ -179,10 +195,165 @@ export function Sidebar() {
   });
   const requestJumpToPosition = useDocumentStore((s) => s.requestJumpToPosition);
   const insertAtCursor = useDocumentStore((s) => s.insertAtCursor);
+  const moveFile = useDocumentStore((s) => s.moveFile);
+  const moveFolder = useDocumentStore((s) => s.moveFolder);
   const closeProject = useDocumentStore((s) => s.closeProject);
   const projectRoot = useDocumentStore((s) => s.projectRoot);
   const folders = useDocumentStore((s) => s.folders);
   const { theme, setTheme } = useTheme();
+
+  // ─── Native OS file drop (Tauri onDragDropEvent) ───
+  const sidebarFilesRef = useRef<HTMLDivElement>(null);
+  const nativeDropTargetRef = useRef<string | null>(null);
+  const [nativeDragOver, setNativeDragOver] = useState<string | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    getCurrentWebview()
+      .onDragDropEvent(async (event) => {
+        if (cancelled) return;
+        const { type } = event.payload;
+
+        if (type === "over" || type === "enter") {
+          const payload = event.payload as { position: { x: number; y: number } };
+          const { x, y } = payload.position;
+          // Tauri reports physical pixels; elementFromPoint expects logical (CSS) pixels
+          const logicalX = x / window.devicePixelRatio;
+          const logicalY = y / window.devicePixelRatio;
+
+          const el = document.elementFromPoint(logicalX, logicalY);
+          const filesArea = sidebarFilesRef.current;
+
+          if (!filesArea || !el || !filesArea.contains(el)) {
+            // Not over the sidebar file tree
+            if (nativeDropTargetRef.current !== null) {
+              console.log("[native-drop] left sidebar area");
+              nativeDropTargetRef.current = null;
+              setNativeDragOver(null);
+            }
+            return;
+          }
+
+          // Walk up from the hovered element to find the closest drop-folder target
+          const folderEl = el.closest("[data-drop-folder]") as HTMLElement | null;
+          const folder = folderEl?.dataset.dropFolder ?? "__root__";
+          if (folder !== nativeDropTargetRef.current) {
+            console.log("[native-drop] hover target changed:", {
+              from: nativeDropTargetRef.current,
+              to: folder,
+              position: { logicalX, logicalY },
+              element: el.tagName,
+            });
+          }
+          nativeDropTargetRef.current = folder;
+          setNativeDragOver(folder);
+        } else if (type === "drop") {
+          const payload = event.payload as { paths: string[]; position: { x: number; y: number } };
+          const { paths, position } = payload;
+          const logicalX = position.x / window.devicePixelRatio;
+          const logicalY = position.y / window.devicePixelRatio;
+
+          const el = document.elementFromPoint(logicalX, logicalY);
+          const filesArea = sidebarFilesRef.current;
+
+          console.log("[native-drop] drop event:", {
+            paths,
+            position: { logicalX, logicalY },
+            overSidebar: !!(filesArea && el && filesArea.contains(el)),
+            targetFolder: nativeDropTargetRef.current,
+          });
+
+          if (!filesArea || !el || !filesArea.contains(el)) {
+            console.log("[native-drop] drop outside sidebar files area, ignoring");
+            setNativeDragOver(null);
+            nativeDropTargetRef.current = null;
+            return;
+          }
+
+          const targetFolder = nativeDropTargetRef.current === "__root__"
+            ? undefined
+            : (nativeDropTargetRef.current ?? undefined);
+
+          console.log("[native-drop] importing files:", { paths, targetFolder });
+
+          // Mark as handled so chat-composer doesn't also process it
+          (window as any).__sidebarHandledDrop = true;
+          setTimeout(() => { (window as any).__sidebarHandledDrop = false; }, 200);
+
+          try {
+            await importFiles(paths, targetFolder);
+            console.log("[native-drop] import success");
+          } catch (err) {
+            console.error("[native-drop] import failed:", err);
+          }
+
+          setNativeDragOver(null);
+          nativeDropTargetRef.current = null;
+        } else if (type === "leave") {
+          console.log("[native-drop] drag left window");
+          setNativeDragOver(null);
+          nativeDropTargetRef.current = null;
+        }
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {
+        // Not in Tauri environment (dev mode)
+      });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [importFiles]);
+
+  // dnd-kit drag-and-drop (uses PointerSensor — works in Tauri WKWebView)
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+  );
+  const [activeDrag, setActiveDrag] = useState<{ id: string; type: "file" | "folder"; name: string } | null>(null);
+
+  const handleDragStart = useCallback((event: DragStartEvent) => {
+    const { type, name } = event.active.data.current as { type: "file" | "folder"; name: string };
+    console.log("[dnd] dragStart:", { id: event.active.id, type, name });
+    setActiveDrag({ id: event.active.id as string, type, name });
+  }, []);
+
+  const handleDragEnd = useCallback(async (event: DragEndEvent) => {
+    console.log("[dnd] dragEnd:", { activeId: event.active.id, overId: event.over?.id ?? null });
+    setActiveDrag(null);
+    const { active, over } = event;
+    if (!over) { console.log("[dnd] no drop target"); return; }
+
+    const draggedPath = active.id as string;
+    const draggedType = (active.data.current as { type: string }).type;
+    const targetId = over.id as string;
+    const targetFolder = targetId === "__root__" ? null : targetId;
+
+    // Don't move if same parent
+    const draggedParent = draggedPath.includes("/")
+      ? draggedPath.substring(0, draggedPath.lastIndexOf("/"))
+      : null;
+    if (targetFolder === draggedParent) { console.log("[dnd] same parent, skip"); return; }
+
+    // Don't move folder into itself or descendant
+    if (draggedType === "folder" && targetFolder) {
+      if (targetFolder === draggedPath || targetFolder.startsWith(draggedPath + "/")) { console.log("[dnd] folder into self, skip"); return; }
+    }
+
+    console.log("[dnd] moving:", { draggedPath, draggedType, targetFolder });
+    try {
+      if (draggedType === "file") await moveFile(draggedPath, targetFolder);
+      else await moveFolder(draggedPath, targetFolder);
+      console.log("[dnd] move success");
+    } catch (err) {
+      console.error("[dnd] move failed:", err);
+    }
+  }, [moveFile, moveFolder]);
 
   // Dialog state
   const [addDialogOpen, setAddDialogOpen] = useState(false);
@@ -374,7 +545,7 @@ export function Sidebar() {
       <PanelGroup direction="vertical" className="min-h-0 flex-1">
         {/* Files */}
         <Panel defaultSize={50} minSize={15}>
-          <div className="flex h-full flex-col">
+          <div ref={sidebarFilesRef} className="flex h-full flex-col" data-sidebar-files>
             <div className="flex h-8 shrink-0 items-center justify-between border-sidebar-border border-b px-3">
               <div className="flex items-center gap-2">
                 <FolderIcon className="size-3.5 text-muted-foreground" />
@@ -403,51 +574,65 @@ export function Sidebar() {
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
-            <ContextMenu>
-              <ContextMenuTrigger asChild>
-                <div className="min-h-0 flex-1 overflow-y-auto p-1">
-                  {tree.map((node) => (
-                    <FileTreeNode
-                      key={node.relativePath}
-                      node={node}
-                      depth={0}
-                      activeFileId={activeFileId}
-                      expandedFolders={expandedFolders}
-                      onToggleFolder={toggleFolder}
-                      onSelectFile={setActiveFile}
-                      onNewFile={openNewFileDialog}
-                      onNewFolder={openNewFolderDialog}
-                      onImport={handleImport}
-                      onRename={openRenameDialog}
-                      onDelete={deleteFile}
-                      fileCount={files.length}
-                    />
-                  ))}
-                </div>
-              </ContextMenuTrigger>
-              <ContextMenuContent>
-                <ContextMenuItem onClick={() => openNewFileDialog()}>
-                  <FileTextIcon className="mr-2 size-4" />
-                  New File
-                </ContextMenuItem>
-                <ContextMenuItem onClick={() => openNewFolderDialog()}>
-                  <FolderPlusIcon className="mr-2 size-4" />
-                  New Folder
-                </ContextMenuItem>
-                <ContextMenuSeparator />
-                <ContextMenuItem onClick={() => handleImport()}>
-                  <UploadIcon className="mr-2 size-4" />
-                  Import File
-                </ContextMenuItem>
-              </ContextMenuContent>
-            </ContextMenu>
+            <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd} onDragOver={(e) => console.log("[dnd] dragOver:", e.over?.id ?? "none")}>
+              <ContextMenu>
+                <ContextMenuTrigger asChild>
+                  <DroppableRoot nativeDragOver={nativeDragOver === "__root__"}>
+                    {tree.map((node) => (
+                      <FileTreeNode
+                        key={node.relativePath}
+                        node={node}
+                        depth={0}
+                        activeFileId={activeFileId}
+                        expandedFolders={expandedFolders}
+                        onToggleFolder={toggleFolder}
+                        onSelectFile={setActiveFile}
+                        onNewFile={openNewFileDialog}
+                        onNewFolder={openNewFolderDialog}
+                        onImport={handleImport}
+                        onRename={openRenameDialog}
+                        onDelete={deleteFile}
+                        fileCount={files.length}
+                        nativeDragOver={nativeDragOver}
+                      />
+                    ))}
+                  </DroppableRoot>
+                </ContextMenuTrigger>
+                <ContextMenuContent>
+                  <ContextMenuItem onClick={() => openNewFileDialog()}>
+                    <FileTextIcon className="mr-2 size-4" />
+                    New File
+                  </ContextMenuItem>
+                  <ContextMenuItem onClick={() => openNewFolderDialog()}>
+                    <FolderPlusIcon className="mr-2 size-4" />
+                    New Folder
+                  </ContextMenuItem>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem onClick={() => handleImport()}>
+                    <UploadIcon className="mr-2 size-4" />
+                    Import File
+                  </ContextMenuItem>
+                </ContextMenuContent>
+              </ContextMenu>
+              <DragOverlay dropAnimation={null}>
+                {activeDrag && (
+                  <div className="flex items-center gap-2 rounded-md bg-sidebar px-2 py-1 text-sm shadow-lg ring-1 ring-ring">
+                    {activeDrag.type === "folder"
+                      ? <FolderIcon className="size-4 shrink-0" />
+                      : <FileTextIcon className="size-4 shrink-0" />
+                    }
+                    <span className="truncate">{activeDrag.name}</span>
+                  </div>
+                )}
+              </DragOverlay>
+            </DndContext>
           </div>
         </Panel>
 
         <PanelResizeHandle className="h-px bg-sidebar-border transition-colors hover:bg-ring data-resize-handle-active:bg-ring" />
 
         {/* Outline */}
-        <Panel defaultSize={30} minSize={10}>
+        <Panel defaultSize={20} minSize={10}>
           <div className="flex h-full flex-col">
             <div className="flex h-8 shrink-0 items-center gap-2 px-3">
               <ListIcon className="size-3.5 text-muted-foreground" />
@@ -477,8 +662,22 @@ export function Sidebar() {
 
         <PanelResizeHandle className="h-px bg-sidebar-border transition-colors hover:bg-ring data-resize-handle-active:bg-ring" />
 
+        {/* History */}
+        <Panel defaultSize={15} minSize={10}>
+          <div className="flex h-full flex-col">
+            <div className="flex h-8 shrink-0 items-center">
+              <HistoryHeader />
+            </div>
+            <div className="min-h-0 flex-1 overflow-hidden">
+              <HistoryPanel />
+            </div>
+          </div>
+        </Panel>
+
+        <PanelResizeHandle className="h-px bg-sidebar-border transition-colors hover:bg-ring data-resize-handle-active:bg-ring" />
+
         {/* Zotero */}
-        <Panel defaultSize={20} minSize={10}>
+        <Panel defaultSize={15} minSize={10}>
           <div className="flex h-full flex-col">
             <div className="flex h-8 shrink-0 items-center">
               <ZoteroHeader />
@@ -621,6 +820,37 @@ export function Sidebar() {
 
 // ─── File Tree Node ───
 
+// ─── dnd-kit helpers ───
+
+function DroppableRoot({ children, nativeDragOver }: { children: React.ReactNode; nativeDragOver?: boolean }) {
+  const { setNodeRef, isOver } = useDroppable({ id: "__root__" });
+  if (isOver) console.log("[dnd] over: __root__");
+  return (
+    <div
+      ref={setNodeRef}
+      data-drop-folder="__root__"
+      className={cn(
+        "min-h-0 flex-1 overflow-y-auto p-1",
+        (isOver || nativeDragOver) && "bg-accent/30",
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+function DroppableFolder({ id, children, nativeDragOver }: { id: string; children: React.ReactNode; nativeDragOver?: boolean }) {
+  const { setNodeRef, isOver } = useDroppable({ id });
+  if (isOver) console.log("[dnd] over folder:", id);
+  return (
+    <div ref={setNodeRef} data-drop-folder={id} className={cn((isOver || nativeDragOver) && "bg-accent/30 rounded-md")}>
+      {children}
+    </div>
+  );
+}
+
+// ─── File Tree Node ───
+
 interface FileTreeNodeProps {
   node: TreeNode;
   depth: number;
@@ -634,6 +864,7 @@ interface FileTreeNodeProps {
   onRename: (id: string, name: string) => void;
   onDelete: (id: string) => void;
   fileCount: number;
+  nativeDragOver?: string | null;
 }
 
 function FileTreeNode({
@@ -649,119 +880,157 @@ function FileTreeNode({
   onRename,
   onDelete,
   fileCount,
+  nativeDragOver,
 }: FileTreeNodeProps) {
   const isExpanded = expandedFolders.has(node.relativePath);
 
   if (node.type === "folder") {
     return (
-      <ContextMenu>
-        <ContextMenuTrigger asChild>
-          <div>
-            <button
-              className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm transition-colors hover:bg-sidebar-accent/50"
-              style={{ paddingLeft: `${depth * 16 + 4}px` }}
-              onClick={() => onToggleFolder(node.relativePath)}
-            >
-              {isExpanded ? (
-                <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
-              ) : (
-                <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
-              )}
-              <FolderIcon className="size-4 shrink-0" />
-              <span className="truncate">{node.name}</span>
-            </button>
-            {isExpanded &&
-              node.children.map((child) => (
-                <FileTreeNode
-                  key={child.relativePath}
-                  node={child}
-                  depth={depth + 1}
-                  activeFileId={activeFileId}
-                  expandedFolders={expandedFolders}
-                  onToggleFolder={onToggleFolder}
-                  onSelectFile={onSelectFile}
-                  onNewFile={onNewFile}
-                  onNewFolder={onNewFolder}
-                  onImport={onImport}
-                  onRename={onRename}
-                  onDelete={onDelete}
-                  fileCount={fileCount}
-                />
-              ))}
-          </div>
-        </ContextMenuTrigger>
-        <ContextMenuContent>
-          <ContextMenuItem onClick={() => onNewFile(node.relativePath)}>
-            <FileTextIcon className="mr-2 size-4" />
-            New File Here
-          </ContextMenuItem>
-          <ContextMenuItem onClick={() => onNewFolder(node.relativePath)}>
-            <FolderPlusIcon className="mr-2 size-4" />
-            New Folder
-          </ContextMenuItem>
-          <ContextMenuItem onClick={() => onImport(node.relativePath)}>
-            <UploadIcon className="mr-2 size-4" />
-            Import File Here
-          </ContextMenuItem>
-          <ContextMenuSeparator />
-          <ContextMenuItem onClick={() => onRename(node.relativePath, node.name)}>
-            <PencilIcon className="mr-2 size-4" />
-            Rename
-          </ContextMenuItem>
-          <ContextMenuItem
-            variant="destructive"
-            onClick={() => {
-              // Delete all files in this folder
-              const filesToDelete = node.children
-                .filter((c) => c.type === "file" && c.file)
-                .map((c) => c.file!.id);
-              for (const id of filesToDelete) onDelete(id);
-            }}
-          >
-            <Trash2Icon className="mr-2 size-4" />
-            Delete
-          </ContextMenuItem>
-        </ContextMenuContent>
-      </ContextMenu>
+      <DroppableFolder id={node.relativePath} nativeDragOver={nativeDragOver === node.relativePath}>
+        <DraggableItem id={node.relativePath} type="folder" name={node.name}>
+          <ContextMenu>
+            <ContextMenuTrigger asChild>
+              <button
+                className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm transition-colors hover:bg-sidebar-accent/50"
+                style={{ paddingLeft: `${depth * 16 + 4}px` }}
+                onClick={() => onToggleFolder(node.relativePath)}
+              >
+                {isExpanded ? (
+                  <ChevronDownIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                ) : (
+                  <ChevronRightIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <FolderIcon className="size-4 shrink-0" />
+                <span className="truncate">{node.name}</span>
+              </button>
+            </ContextMenuTrigger>
+            <ContextMenuContent>
+              <ContextMenuItem onClick={() => onNewFile(node.relativePath)}>
+                <FileTextIcon className="mr-2 size-4" />
+                New File Here
+              </ContextMenuItem>
+              <ContextMenuItem onClick={() => onNewFolder(node.relativePath)}>
+                <FolderPlusIcon className="mr-2 size-4" />
+                New Folder
+              </ContextMenuItem>
+              <ContextMenuItem onClick={() => onImport(node.relativePath)}>
+                <UploadIcon className="mr-2 size-4" />
+                Import File Here
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+              <ContextMenuItem onClick={() => onRename(node.relativePath, node.name)}>
+                <PencilIcon className="mr-2 size-4" />
+                Rename
+              </ContextMenuItem>
+              <ContextMenuItem
+                variant="destructive"
+                onClick={() => {
+                  const filesToDelete = node.children
+                    .filter((c) => c.type === "file" && c.file)
+                    .map((c) => c.file!.id);
+                  for (const id of filesToDelete) onDelete(id);
+                }}
+              >
+                <Trash2Icon className="mr-2 size-4" />
+                Delete
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>
+        </DraggableItem>
+        {isExpanded &&
+          node.children.map((child) => (
+            <FileTreeNode
+              key={child.relativePath}
+              node={child}
+              depth={depth + 1}
+              activeFileId={activeFileId}
+              expandedFolders={expandedFolders}
+              onToggleFolder={onToggleFolder}
+              onSelectFile={onSelectFile}
+              onNewFile={onNewFile}
+              onNewFolder={onNewFolder}
+              onImport={onImport}
+              onRename={onRename}
+              onDelete={onDelete}
+              fileCount={fileCount}
+              nativeDragOver={nativeDragOver}
+            />
+          ))}
+      </DroppableFolder>
     );
   }
 
   // File node
   const file = node.file!;
   return (
-    <ContextMenu>
-      <ContextMenuTrigger asChild>
-        <button
-          className={cn(
-            "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors",
-            file.id === activeFileId
-              ? "bg-sidebar-accent text-sidebar-accent-foreground"
-              : "hover:bg-sidebar-accent/50",
-          )}
-          style={{ paddingLeft: `${depth * 16 + 8}px` }}
-          onClick={() => onSelectFile(file.id)}
-        >
-          {getFileIcon(file)}
-          <span className="truncate">
-            {node.name}
-            {file.isDirty && <span className="ml-1 text-muted-foreground">*</span>}
-          </span>
-        </button>
-      </ContextMenuTrigger>
-      <ContextMenuContent>
-        <ContextMenuItem onClick={() => onRename(file.id, file.name)}>
-          <PencilIcon className="mr-2 size-4" />
-          Rename
-        </ContextMenuItem>
-        <ContextMenuItem
-          variant="destructive"
-          onClick={() => onDelete(file.id)}
-          disabled={fileCount <= 1}
-        >
-          <Trash2Icon className="mr-2 size-4" />
-          Delete
-        </ContextMenuItem>
-      </ContextMenuContent>
-    </ContextMenu>
+    <DraggableItem id={file.relativePath} type="file" name={node.name}>
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <button
+            className={cn(
+              "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors",
+              file.id === activeFileId
+                ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                : "hover:bg-sidebar-accent/50",
+            )}
+            style={{ paddingLeft: `${depth * 16 + 8}px` }}
+            onClick={() => onSelectFile(file.id)}
+          >
+            {getFileIcon(file)}
+            <span className="truncate">
+              {node.name}
+              {file.isDirty && <span className="ml-1 text-muted-foreground">*</span>}
+            </span>
+          </button>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem onClick={() => onRename(file.id, file.name)}>
+            <PencilIcon className="mr-2 size-4" />
+            Rename
+          </ContextMenuItem>
+          <ContextMenuItem
+            variant="destructive"
+            onClick={() => onDelete(file.id)}
+            disabled={fileCount <= 1}
+          >
+            <Trash2Icon className="mr-2 size-4" />
+            Delete
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+    </DraggableItem>
+  );
+}
+
+// ─── Draggable wrapper ───
+
+function DraggableItem({ id, type, name, children }: { id: string; type: "file" | "folder"; name: string; children: React.ReactNode }) {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id,
+    data: { type, name },
+  });
+
+  // Wrap listeners to log pointer events
+  const wrappedListeners = listeners ? Object.fromEntries(
+    Object.entries(listeners).map(([key, handler]) => [
+      key,
+      (e: React.PointerEvent) => {
+        console.log(`[dnd] ${key} on "${name}" (${type})`, { id, pointerType: e.pointerType, button: e.button });
+        (handler as (e: React.PointerEvent) => void)(e);
+      },
+    ]),
+  ) : {};
+
+  if (isDragging) console.log("[dnd] dragging:", id);
+
+  return (
+    <div
+      ref={setNodeRef}
+      {...wrappedListeners}
+      {...attributes}
+      style={{ opacity: isDragging ? 0.4 : 1 }}
+    >
+      {children}
+    </div>
   );
 }

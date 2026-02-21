@@ -12,7 +12,7 @@ import {
 import { join } from "@tauri-apps/api/path";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
-export type ProjectFileType = "tex" | "image" | "bib" | "style" | "other";
+export type ProjectFileType = "tex" | "image" | "pdf" | "bib" | "style" | "other";
 
 export interface FsProjectFile {
   relativePath: string;
@@ -28,7 +28,6 @@ const IMAGE_EXTENSIONS = new Set([
   ".svg",
   ".bmp",
   ".webp",
-  ".pdf",
 ]);
 
 const STYLE_EXTENSIONS = new Set([
@@ -70,6 +69,7 @@ function getFileType(name: string): ProjectFileType | null {
   }
   if (lower.endsWith(".tex") || lower.endsWith(".ltx")) return "tex";
   if (lower.endsWith(".bib")) return "bib";
+  if (lower.endsWith(".pdf")) return "pdf";
   for (const ext of IMAGE_EXTENSIONS) {
     if (lower.endsWith(ext)) return "image";
   }
@@ -177,14 +177,51 @@ export async function createFileOnDisk(
   return fullPath;
 }
 
+/**
+ * Generate a unique filename by appending (1), (2), etc. if the target already exists.
+ * Returns the deduplicated relative path (e.g., "attachments/paper (1).pdf").
+ */
+export async function getUniqueTargetName(
+  rootPath: string,
+  targetName: string,
+): Promise<string> {
+  const fullPath = await join(rootPath, targetName);
+  if (!(await exists(fullPath))) return targetName;
+
+  // Split into base and extension: "attachments/paper.pdf" → ["attachments/paper", ".pdf"]
+  const dotIndex = targetName.lastIndexOf(".");
+  const slashIndex = targetName.lastIndexOf("/");
+  const hasExt = dotIndex > slashIndex + 1;
+  const baseName = hasExt ? targetName.slice(0, dotIndex) : targetName;
+  const ext = hasExt ? targetName.slice(dotIndex) : "";
+
+  for (let i = 1; i < 100; i++) {
+    const candidate = `${baseName} (${i})${ext}`;
+    const candidatePath = await join(rootPath, candidate);
+    if (!(await exists(candidatePath))) return candidate;
+  }
+  // Fallback — should never reach here
+  return `${baseName} (${Date.now()})${ext}`;
+}
+
 export async function copyFileToProject(
   rootPath: string,
   sourcePath: string,
   targetName: string,
 ): Promise<string> {
-  const fullPath = await join(rootPath, targetName);
+  // Auto-deduplicate filename
+  const uniqueName = await getUniqueTargetName(rootPath, targetName);
+  const fullPath = await join(rootPath, uniqueName);
+  // Ensure parent directory exists (e.g., attachments/)
+  const lastSlash = fullPath.lastIndexOf("/");
+  if (lastSlash > 0) {
+    const parentDir = fullPath.substring(0, lastSlash);
+    if (!(await exists(parentDir))) {
+      await mkdir(parentDir, { recursive: true });
+    }
+  }
   await copyFile(sourcePath, fullPath);
-  return fullPath;
+  return uniqueName;
 }
 
 export async function deleteFileFromDisk(absolutePath: string): Promise<void> {

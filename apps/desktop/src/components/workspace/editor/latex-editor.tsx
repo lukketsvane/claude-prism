@@ -31,6 +31,7 @@ import { linter, lintGutter, forEachDiagnostic, type Diagnostic } from "@codemir
 import { useDocumentStore } from "@/stores/document-store";
 import { useProposedChangesStore, type ProposedChange } from "@/stores/proposed-changes-store";
 import { useClaudeChatStore } from "@/stores/claude-chat-store";
+import { useHistoryStore } from "@/stores/history-store";
 import { compileLatex } from "@/lib/latex-compiler";
 import { EditorToolbar } from "./editor-toolbar";
 import { SelectionToolbar, type ToolbarAction } from "./selection-toolbar";
@@ -228,6 +229,10 @@ export function LatexEditor() {
     setIsCompiling(true);
     try {
       await saveAllFiles();
+      // Pre-compile snapshot
+      try {
+        await useHistoryStore.getState().createSnapshot(projectRoot, "[compile] Pre-compile");
+      } catch { /* snapshot failure should not block compile */ }
       const targetFile = activeFile?.relativePath || "document.tex";
       const data = await compileLatex(projectRoot, targetFile);
       setPdfData(data);
@@ -363,33 +368,35 @@ export function LatexEditor() {
         history(),
         keymap.of([...defaultKeymap, ...historyKeymap]),
         latex({ enableLinting: false }),
-        linter((view) => {
-          // Wait until the Lezer parser has fully parsed the document
-          // to avoid false positives from incomplete syntax trees
-          if (!syntaxTreeAvailable(view.state, view.state.doc.length)) {
-            return [];
-          }
-          const baseLinter = latexLinter();
-          const diagnostics = baseLinter(view);
-          return diagnostics.map((d: Diagnostic) => ({
-            ...d,
-            actions: [
-              ...(d.actions ?? []),
-              {
-                name: "Fix with chat",
-                apply: (v: EditorView, from: number, _to: number) => {
-                  const line = v.state.doc.lineAt(from);
-                  const docState = useDocumentStore.getState();
-                  const file = docState.files.find((f) => f.id === docState.activeFileId);
-                  const fileName = file?.relativePath ?? "document.tex";
-                  const ctx = `[Lint error in ${fileName}:${line.number}]\n[Error: ${d.message}]`;
-                  useClaudeChatStore.getState().sendPrompt(`${ctx}\n\nFix this lint error.`);
+        ...(activeFile?.type === "tex" ? [
+          linter((view) => {
+            // Wait until the Lezer parser has fully parsed the document
+            // to avoid false positives from incomplete syntax trees
+            if (!syntaxTreeAvailable(view.state, view.state.doc.length)) {
+              return [];
+            }
+            const baseLinter = latexLinter();
+            const diagnostics = baseLinter(view);
+            return diagnostics.map((d: Diagnostic) => ({
+              ...d,
+              actions: [
+                ...(d.actions ?? []),
+                {
+                  name: "Fix with chat",
+                  apply: (v: EditorView, from: number, _to: number) => {
+                    const line = v.state.doc.lineAt(from);
+                    const docState = useDocumentStore.getState();
+                    const file = docState.files.find((f) => f.id === docState.activeFileId);
+                    const fileName = file?.relativePath ?? "document.tex";
+                    const ctx = `[Lint error in ${fileName}:${line.number}]\n[Error: ${d.message}]`;
+                    useClaudeChatStore.getState().sendPrompt(`${ctx}\n\nFix this lint error.`);
+                  },
                 },
-              },
-            ],
-          }));
-        }),
-        lintGutter(),
+              ],
+            }));
+          }),
+          lintGutter(),
+        ] : []),
         themeCompartmentRef.current.of(
           resolvedTheme === "dark"
             ? [oneDark, syntaxHighlighting(oneDarkHighlightStyle)]
@@ -589,6 +596,28 @@ export function LatexEditor() {
   const handleToolbarDismiss = useCallback(() => {
     setSelectionCoords(null);
   }, []);
+
+  if (activeFile?.type === "pdf") {
+    return (
+      <div className="flex h-full flex-col bg-background">
+        <EditorToolbar editorView={viewRef} fileType="image" imageScale={imageScale} onImageScaleChange={setImageScale} />
+        <div className="relative min-h-0 flex-1 overflow-hidden">
+          {activeFile.dataUrl ? (
+            <iframe
+              src={activeFile.dataUrl}
+              className="h-full w-full border-0"
+              title={activeFile.name}
+            />
+          ) : (
+            <div className="flex h-full items-center justify-center text-muted-foreground text-sm">
+              Unable to load PDF
+            </div>
+          )}
+          <ClaudeChatDrawer />
+        </div>
+      </div>
+    );
+  }
 
   if (!isTextFile && activeFile) {
     return (

@@ -1,4 +1,5 @@
 mod claude;
+mod history;
 mod zotero;
 
 use std::process::Command;
@@ -89,6 +90,14 @@ pub fn run() {
             zotero::zotero_start_oauth,
             zotero::zotero_complete_oauth,
             zotero::zotero_cancel_oauth,
+            history::history_init,
+            history::history_snapshot,
+            history::history_list,
+            history::history_diff,
+            history::history_file_at,
+            history::history_restore,
+            history::history_add_label,
+            history::history_remove_label,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

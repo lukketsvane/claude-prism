@@ -1,5 +1,6 @@
 import { type FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowUpIcon, SquareIcon, PlusIcon, XIcon, FileTextIcon, FileCodeIcon, FileIcon, ImageIcon } from "lucide-react";
+import { ArrowUpIcon, SquareIcon, XIcon, FileTextIcon, FileCodeIcon, FileIcon, ImageIcon, FileSpreadsheetIcon, PaperclipIcon } from "lucide-react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useClaudeChatStore, offsetToLineCol } from "@/stores/claude-chat-store";
 import { useDocumentStore, type ProjectFile } from "@/stores/document-store";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
@@ -13,6 +14,7 @@ interface PinnedContext {
 
 function getFileIcon(file: ProjectFile) {
   if (file.type === "image") return <ImageIcon className="size-3.5 shrink-0 text-muted-foreground" />;
+  if (file.type === "pdf") return <FileSpreadsheetIcon className="size-3.5 shrink-0 text-muted-foreground" />;
   if (file.type === "style") return <FileCodeIcon className="size-3.5 shrink-0 text-muted-foreground" />;
   if (file.type === "other") return <FileIcon className="size-3.5 shrink-0 text-muted-foreground" />;
   return <FileTextIcon className="size-3.5 shrink-0 text-muted-foreground" />;
@@ -21,13 +23,15 @@ function getFileIcon(file: ProjectFile) {
 export const ChatComposer: FC = () => {
   const sendPrompt = useClaudeChatStore((s) => s.sendPrompt);
   const cancelExecution = useClaudeChatStore((s) => s.cancelExecution);
-  const newSession = useClaudeChatStore((s) => s.newSession);
   const isStreaming = useClaudeChatStore((s) => s.isStreaming);
   const [input, setInput] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Pinned context — persists after selection clears and after send
-  const [pinnedContext, setPinnedContext] = useState<PinnedContext | null>(null);
+  // Pinned contexts — supports multiple files/selections
+  const [pinnedContexts, setPinnedContexts] = useState<PinnedContext[]>([]);
+
+  // File drop state
+  const [isDragOver, setIsDragOver] = useState(false);
 
   // @ mention state
   const [mentionQuery, setMentionQuery] = useState<string | null>(null);
@@ -39,6 +43,8 @@ export const ChatComposer: FC = () => {
   const selectionRange = useDocumentStore((s) => s.selectionRange);
   const activeFileId = useDocumentStore((s) => s.activeFileId);
   const files = useDocumentStore((s) => s.files);
+  const importFiles = useDocumentStore((s) => s.importFiles);
+  const projectRoot = useDocumentStore((s) => s.projectRoot);
 
   const currentContextLabel = useMemo(() => {
     if (!selectionRange) return null;
@@ -54,10 +60,17 @@ export const ChatComposer: FC = () => {
     if (!selectionRange || !currentContextLabel) return;
     const file = files.find((f) => f.id === activeFileId);
     if (!file?.content) return;
-    setPinnedContext({
-      label: currentContextLabel,
-      filePath: file.relativePath,
-      selectedText: file.content.slice(selectionRange.start, selectionRange.end),
+    // Replace any existing selection-based context (keep file contexts)
+    setPinnedContexts((prev) => {
+      const filtered = prev.filter((c) => !c.label.includes(":") || c.label.startsWith("@attachments/"));
+      return [
+        ...filtered,
+        {
+          label: currentContextLabel,
+          filePath: file.relativePath,
+          selectedText: file.content!.slice(selectionRange.start, selectionRange.end),
+        },
+      ];
     });
   }, [selectionRange, currentContextLabel, activeFileId, files]);
 
@@ -69,7 +82,6 @@ export const ChatComposer: FC = () => {
     }
     const q = mentionQuery.toLowerCase();
     const matched = files
-      .filter((f) => f.type !== "image")
       .filter((f) => f.relativePath.toLowerCase().includes(q) || f.name.toLowerCase().includes(q))
       .slice(0, 8);
     setMentionFiles(matched);
@@ -90,24 +102,130 @@ export const ChatComposer: FC = () => {
     setMentionQuery(null);
 
     // Pin the whole file as context
-    setPinnedContext({
-      label: `@${file.relativePath}`,
-      filePath: file.relativePath,
-      selectedText: file.content ?? "",
-    });
+    const isTextFile = file.type === "tex" || file.type === "bib" || file.type === "style" || file.type === "other";
+    setPinnedContexts((prev) => [
+      ...prev,
+      {
+        label: `@${file.relativePath}`,
+        filePath: file.relativePath,
+        selectedText: isTextFile
+          ? (file.content ?? "")
+          : `[Referenced file: ${file.relativePath} (${file.type} file)]`,
+      },
+    ]);
 
     // Refocus textarea
     setTimeout(() => textarea.focus(), 0);
   }, [input]);
+
+  // Handle file drops — guard against duplicate calls from stale HMR listeners
+  const isProcessingDropRef = useRef(false);
+  const handleFileDropRef = useRef<(paths: string[]) => Promise<void>>(async () => {});
+  handleFileDropRef.current = async (paths: string[]) => {
+    if (!projectRoot || paths.length === 0) return;
+    if (isProcessingDropRef.current) return;
+    isProcessingDropRef.current = true;
+
+    try {
+      // Import files to attachments/ folder — returns actual (deduplicated) relative paths
+      const importedPaths = await importFiles(paths, "attachments");
+
+      // Pin each file as context
+      const storeFiles = useDocumentStore.getState().files;
+      const newContexts: PinnedContext[] = [];
+
+      for (const relativePath of importedPaths) {
+        const imported = storeFiles.find((f) => f.relativePath === relativePath);
+
+        if (imported) {
+          const isText = imported.type === "tex" || imported.type === "bib" || imported.type === "style" || imported.type === "other";
+          newContexts.push({
+            label: `@${relativePath}`,
+            filePath: relativePath,
+            selectedText: isText
+              ? (imported.content ?? "")
+              : `[Attached file: ${relativePath} (${imported.type} file)]`,
+          });
+        } else {
+          // File imported but type might be filtered out — still pin as reference
+          newContexts.push({
+            label: `@${relativePath}`,
+            filePath: relativePath,
+            selectedText: `[Attached file: ${relativePath}]`,
+          });
+        }
+      }
+
+      if (newContexts.length > 0) {
+        setPinnedContexts((prev) => {
+          // Deduplicate by label
+          const existingLabels = new Set(prev.map((c) => c.label));
+          const unique = newContexts.filter((c) => !existingLabels.has(c.label));
+          return [...prev, ...unique];
+        });
+      }
+    } finally {
+      isProcessingDropRef.current = false;
+    }
+  };
+
+  // Listen for Tauri drag-drop events (OS file drops)
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    getCurrentWebview()
+      .onDragDropEvent(async (event) => {
+        if (cancelled) return;
+        const { type } = event.payload;
+        if (type === "enter") {
+          setIsDragOver(true);
+        } else if (type === "drop") {
+          setIsDragOver(false);
+          // Skip if the sidebar already handled this drop (OS file dropped on sidebar file tree)
+          if ((window as any).__sidebarHandledDrop) {
+            console.log("[chat-drop] skipped — sidebar handled this drop");
+            return;
+          }
+          const paths = (event.payload as { paths: string[] }).paths;
+          if (paths?.length > 0) {
+            await handleFileDropRef.current?.(paths);
+          }
+        } else if (type === "leave") {
+          setIsDragOver(false);
+        }
+      })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => {
+        // Not in Tauri environment (dev mode), ignore
+      });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   const handleSend = useCallback(() => {
     const trimmed = input.trim();
     if (!trimmed || isStreaming) return;
     setInput("");
     setMentionQuery(null);
-    // Send with pinned context override so it works even if selection was cleared
-    if (pinnedContext) {
-      sendPrompt(trimmed, pinnedContext);
+    // Send with pinned context override
+    if (pinnedContexts.length > 0) {
+      const combinedLabel = pinnedContexts.map((c) => c.label).join(", ");
+      const combinedText = pinnedContexts.map((c) => c.selectedText).join("\n\n---\n\n");
+      sendPrompt(trimmed, {
+        label: combinedLabel,
+        filePath: pinnedContexts[0].filePath,
+        selectedText: combinedText,
+      });
     } else {
       sendPrompt(trimmed);
     }
@@ -115,9 +233,9 @@ export const ChatComposer: FC = () => {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-    // Clear pinned context after send — it's now part of the chat message
-    setPinnedContext(null);
-  }, [input, isStreaming, sendPrompt, pinnedContext]);
+    // Clear pinned contexts after send
+    setPinnedContexts([]);
+  }, [input, isStreaming, sendPrompt, pinnedContexts]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -149,13 +267,13 @@ export const ChatComposer: FC = () => {
         e.preventDefault();
         handleSend();
       }
-      // Backspace at start of empty input removes pinned context
-      if (e.key === "Backspace" && pinnedContext && input === "") {
+      // Backspace at start of empty input removes last pinned context
+      if (e.key === "Backspace" && pinnedContexts.length > 0 && input === "") {
         e.preventDefault();
-        setPinnedContext(null);
+        setPinnedContexts((prev) => prev.slice(0, -1));
       }
     },
-    [handleSend, pinnedContext, input, mentionQuery, mentionFiles, mentionIndex, selectMention],
+    [handleSend, pinnedContexts, input, mentionQuery, mentionFiles, mentionIndex, selectMention],
   );
 
   const handleInput = useCallback(
@@ -227,69 +345,75 @@ export const ChatComposer: FC = () => {
         </div>
       )}
 
-      <div className="flex w-full flex-col rounded-2xl border border-input bg-muted/30 transition-colors focus-within:border-ring focus-within:bg-background">
-        {/* Pinned context chip + textarea in one flow */}
-        <div className="flex flex-wrap items-center gap-1 px-4 pt-3 pb-0">
-          {pinnedContext && (
-            <span className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground">
-              {pinnedContext.label}
-              <button
-                onClick={() => setPinnedContext(null)}
-                className="ml-0.5 rounded-sm p-0.5 transition-colors hover:bg-muted-foreground/20"
+      <div
+        className={cn(
+          "flex w-full flex-col rounded-2xl border border-input bg-muted/30 transition-colors focus-within:border-ring focus-within:bg-background",
+          isDragOver && "border-ring bg-accent/20",
+        )}
+      >
+        {/* Pinned context chips */}
+        {pinnedContexts.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1 px-4 pt-3 pb-0">
+            {pinnedContexts.map((ctx, i) => (
+              <span
+                key={`${ctx.label}-${i}`}
+                className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground"
               >
-                <XIcon className="size-3" />
-              </button>
-            </span>
-          )}
-        </div>
-        <textarea
-          ref={textareaRef}
-          value={input}
-          onChange={handleInput}
-          onKeyDown={handleKeyDown}
-          placeholder="Ask about LaTeX..."
-          className="max-h-40 min-h-10 w-full resize-none bg-transparent px-4 py-2 text-sm outline-none placeholder:text-muted-foreground"
-          autoFocus
-          rows={1}
-        />
-        <div className="flex items-center justify-between px-2 pb-2">
-          <TooltipIconButton
-            tooltip="New conversation"
-            side="top"
-            variant="ghost"
-            size="icon"
-            className="size-8 rounded-full"
-            onClick={newSession}
-          >
-            <PlusIcon className="size-4" />
-          </TooltipIconButton>
-
-          <div>
-            {isStreaming ? (
-              <TooltipIconButton
-                tooltip="Stop"
-                side="top"
-                variant="secondary"
-                size="icon"
-                className="size-8 rounded-full"
-                onClick={cancelExecution}
-              >
-                <SquareIcon className="size-3 fill-current" />
-              </TooltipIconButton>
-            ) : (
-              <TooltipIconButton
-                tooltip="Send"
-                side="top"
-                variant="default"
-                size="icon"
-                className="size-8 rounded-full"
-                onClick={handleSend}
-                disabled={!input.trim()}
-              >
-                <ArrowUpIcon className="size-4" />
-              </TooltipIconButton>
-            )}
+                {ctx.label}
+                <button
+                  onClick={() => setPinnedContexts((prev) => prev.filter((_, idx) => idx !== i))}
+                  className="ml-0.5 rounded-sm p-0.5 transition-colors hover:bg-muted-foreground/20"
+                >
+                  <XIcon className="size-3" />
+                </button>
+              </span>
+            ))}
           </div>
+        )}
+
+        {isDragOver ? (
+          <div className="flex min-h-10 items-center justify-center px-4 py-3 text-sm text-muted-foreground">
+            <PaperclipIcon className="mr-2 size-4" />
+            Drop files to attach
+          </div>
+        ) : (
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={handleInput}
+            onKeyDown={handleKeyDown}
+            placeholder="Ask about LaTeX... (@ to mention, drop files to attach)"
+            className="max-h-40 min-h-10 w-full resize-none bg-transparent px-4 py-2 text-sm outline-none placeholder:text-muted-foreground"
+            autoFocus
+            rows={1}
+          />
+        )}
+
+        <div className="flex items-center justify-end px-2 pb-2">
+          {isStreaming ? (
+            <TooltipIconButton
+              tooltip="Stop"
+              side="top"
+              variant="secondary"
+              size="icon"
+              className="size-8 rounded-full"
+              onClick={cancelExecution}
+            >
+              <SquareIcon className="size-3 fill-current" />
+            </TooltipIconButton>
+          ) : (
+            <TooltipIconButton
+              tooltip="Send"
+              side="top"
+              variant="default"
+              size="icon"
+              className="size-8 rounded-full"
+              onClick={handleSend}
+              disabled={!input.trim()}
+            >
+              <ArrowUpIcon className="size-4" />
+            </TooltipIconButton>
+          )}
         </div>
       </div>
     </div>

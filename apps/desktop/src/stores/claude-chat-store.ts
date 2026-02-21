@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { useDocumentStore } from "./document-store";
+import { useHistoryStore } from "./history-store";
 
 /** Convert a character offset to 1-based line:col */
 export function offsetToLineCol(
@@ -128,6 +129,13 @@ export const useClaudeChatStore = create<ClaudeChatState>()((set, get) => ({
       await docState.saveAllFiles();
     }
 
+    // Snapshot before Claude edit
+    if (projectPath) {
+      try {
+        await useHistoryStore.getState().createSnapshot(projectPath, "[claude] Before Claude edit");
+      } catch { /* snapshot failure should not block Claude */ }
+    }
+
     // Build prompt with full context for Claude
     let prompt = userPrompt;
     if (activeFile) {
@@ -229,6 +237,13 @@ export const useClaudeChatStore = create<ClaudeChatState>()((set, get) => ({
 
   _setStreaming: (streaming: boolean) => {
     set({ isStreaming: streaming });
+    // After Claude finishes, snapshot the result
+    if (!streaming) {
+      const projectPath = useDocumentStore.getState().projectRoot;
+      if (projectPath) {
+        useHistoryStore.getState().createSnapshot(projectPath, "[claude] After Claude edit").catch(() => {});
+      }
+    }
   },
 
   _setError: (error: string | null) => {
