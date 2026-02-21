@@ -1,5 +1,5 @@
 import { type FC, useEffect, useMemo, useRef } from "react";
-import { BotIcon, UserIcon } from "lucide-react";
+import { AlertCircleIcon, BotIcon, UserIcon } from "lucide-react";
 import { useClaudeChatStore, type ClaudeStreamMessage, type ContentBlock } from "@/stores/claude-chat-store";
 import { MarkdownRenderer } from "./markdown-renderer";
 import { ToolWidget } from "./tool-widgets";
@@ -136,6 +136,77 @@ const UserMessage: FC<{ message: ClaudeStreamMessage }> = ({ message }) => {
   const contextMatch = textContent.match(/^(~?@[^\n]+)\n([\s\S]*)$/);
   const contextLabel = contextMatch?.[1] ?? null;
   const bodyText = contextMatch ? contextMatch[2] : textContent;
+
+  // Parse error block patterns for styled rendering:
+  // Lint single: "[Lint error in FILE:LINE]\n[Error: MSG]\n\nPrompt"
+  // Lint multi:  "[Lint errors in FILE]\n- FILE:LINE — MSG\n...\n\nPrompt"
+  // Compile:     "[Compilation errors]\n- error1\n- error2\n...\n\nPrompt"
+  const lintSingleMatch = bodyText.match(
+    /^\[Lint error in ([^\]]+)\]\n\[Error: ([^\]]+)\]\n\n([\s\S]*)$/
+  );
+  const lintMultiMatch = bodyText.match(
+    /^\[Lint errors in ([^\]]+)\]\n((?:- .+\n?)+)\n([\s\S]*)$/
+  );
+  const compileErrorMatch = bodyText.match(
+    /^\[Compilation errors\]\n((?:- .+\n?)+)\n([\s\S]*)$/
+  );
+
+  // Shared error block renderer
+  const renderErrorBlock = (
+    title: string,
+    errors: { message: string; location?: string }[],
+    prompt: string,
+  ) => (
+    <div className="flex w-full flex-col items-end py-1.5">
+      <div className="max-w-[85%] rounded-xl bg-muted px-3 py-2 text-foreground text-sm">
+        <div className="mb-2 rounded-lg border border-red-500/20 bg-red-500/10 px-2.5 py-2">
+          <div className="mb-1.5 text-xs font-medium text-red-400">{title}</div>
+          <div className="space-y-1">
+            {errors.map((e, i) => (
+              <div key={i} className="flex items-start gap-1.5">
+                <AlertCircleIcon className="mt-0.5 size-3 shrink-0 text-red-400/70" />
+                <span className="flex-1 text-xs text-foreground/80">{e.message}</span>
+                {e.location && (
+                  <span className="shrink-0 font-mono text-xs text-muted-foreground">{e.location}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+        <span className="text-muted-foreground">{prompt}</span>
+      </div>
+    </div>
+  );
+
+  if (lintSingleMatch) {
+    const [, location, errorMsg, prompt] = lintSingleMatch;
+    return renderErrorBlock(
+      `Lint Error`,
+      [{ message: errorMsg, location }],
+      prompt,
+    );
+  }
+
+  if (lintMultiMatch) {
+    const [, fileName, errorLines, prompt] = lintMultiMatch;
+    const errors = errorLines.trim().split("\n").map((line) => {
+      const m = line.match(/^- (.+?):(\d+) — (.+)$/);
+      return m ? { message: m[3], location: `${m[1]}:${m[2]}` } : { message: line.replace(/^- /, "") };
+    });
+    return renderErrorBlock(`Lint Errors — ${fileName}`, errors, prompt);
+  }
+
+  if (compileErrorMatch) {
+    const [, errorLines, prompt] = compileErrorMatch;
+    const errors = errorLines.trim().split("\n").map((line) => ({
+      message: line.replace(/^- /, ""),
+    }));
+    return renderErrorBlock(
+      `Compilation ${errors.length === 1 ? "Error" : "Errors"}`,
+      errors,
+      prompt,
+    );
+  }
 
   return (
     <div className="flex w-full flex-col items-end py-1.5">

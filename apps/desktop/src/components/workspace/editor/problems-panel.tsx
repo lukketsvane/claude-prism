@@ -6,6 +6,8 @@ import {
   ChevronDownIcon,
   ChevronRightIcon,
   MessageSquareIcon,
+  SparklesIcon,
+  MousePointerClickIcon,
 } from "lucide-react";
 
 export interface DiagnosticItem {
@@ -21,6 +23,7 @@ interface ProblemsPanelProps {
   fileName: string;
   onNavigate: (from: number) => void;
   onFixWithChat: (message: string, line: number) => void;
+  onFixAllWithChat?: () => void;
 }
 
 function SeverityIcon({ severity }: { severity: string }) {
@@ -39,6 +42,7 @@ export function ProblemsPanel({
   fileName,
   onNavigate,
   onFixWithChat,
+  onFixAllWithChat,
 }: ProblemsPanelProps) {
   const [isCollapsed, setIsCollapsed] = useState(false);
 
@@ -48,31 +52,43 @@ export function ProblemsPanel({
   return (
     <div className="border-border border-t bg-background">
       {/* Header */}
-      <button
-        onClick={() => setIsCollapsed(!isCollapsed)}
-        className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/50 transition-colors"
-      >
-        {isCollapsed ? (
-          <ChevronRightIcon className="size-3.5 text-muted-foreground" />
-        ) : (
-          <ChevronDownIcon className="size-3.5 text-muted-foreground" />
+      <div className="flex items-center">
+        <button
+          onClick={() => setIsCollapsed(!isCollapsed)}
+          className="flex flex-1 items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/50 transition-colors"
+        >
+          {isCollapsed ? (
+            <ChevronRightIcon className="size-3.5 text-muted-foreground" />
+          ) : (
+            <ChevronDownIcon className="size-3.5 text-muted-foreground" />
+          )}
+          <span className="font-medium text-foreground">Problems</span>
+          <div className="flex items-center gap-2">
+            {errorCount > 0 && (
+              <span className="flex items-center gap-1">
+                <AlertCircleIcon className="size-3 text-red-400" />
+                <span className="text-muted-foreground">{errorCount}</span>
+              </span>
+            )}
+            {warningCount > 0 && (
+              <span className="flex items-center gap-1">
+                <AlertTriangleIcon className="size-3 text-yellow-400" />
+                <span className="text-muted-foreground">{warningCount}</span>
+              </span>
+            )}
+          </div>
+        </button>
+        {diagnostics.length > 0 && onFixAllWithChat && (
+          <button
+            onClick={onFixAllWithChat}
+            className="flex items-center gap-1.5 mx-3 my-2 px-2.5 py-1 rounded-md text-xs font-medium text-primary-foreground bg-primary hover:bg-primary/90 transition-colors shadow-sm"
+            title="Fix all problems with AI"
+          >
+            <MousePointerClickIcon className="size-3" />
+            <span>Fix with Chat</span>
+          </button>
         )}
-        <span className="font-medium text-foreground">Problems</span>
-        <div className="flex items-center gap-2">
-          {errorCount > 0 && (
-            <span className="flex items-center gap-1">
-              <AlertCircleIcon className="size-3 text-red-400" />
-              <span className="text-muted-foreground">{errorCount}</span>
-            </span>
-          )}
-          {warningCount > 0 && (
-            <span className="flex items-center gap-1">
-              <AlertTriangleIcon className="size-3 text-yellow-400" />
-              <span className="text-muted-foreground">{warningCount}</span>
-            </span>
-          )}
-        </div>
-      </button>
+      </div>
 
       {/* Diagnostic list */}
       {!isCollapsed && (

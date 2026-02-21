@@ -11,7 +11,7 @@ import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 
 const MIN_HEIGHT = 150;
-const DEFAULT_HEIGHT = 180;
+const DEFAULT_HEIGHT = 360;
 
 export function ClaudeChatDrawer() {
   // Initialize event listeners for Claude streaming

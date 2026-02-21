@@ -8,6 +8,7 @@ import {
   MinusIcon,
   PlusIcon,
   DownloadIcon,
+  MousePointerClickIcon,
 } from "lucide-react";
 import { useDocumentStore } from "@/stores/document-store";
 import { useClaudeChatStore } from "@/stores/claude-chat-store";
@@ -333,11 +334,58 @@ export function PdfPreview() {
 
   const renderContent = () => {
     if (compileError) {
+      // Parse individual errors from the compile output, dedup
+      const errors = [...new Set(
+        compileError
+          .split(/\s*!\s*/)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0 && s !== "Compilation failed")
+      )];
+
+      const handleFixWithChat = () => {
+        const errorList = errors.map((e) => `- ${e}`).join("\n");
+        useClaudeChatStore.getState().sendPrompt(
+          `[Compilation errors]\n${errorList}\n\nFix these LaTeX compilation errors.`
+        );
+      };
+
       return (
-        <div className="flex flex-1 flex-col items-center justify-center bg-muted/30 p-8">
-          <AlertCircleIcon className="mb-4 size-12 text-destructive" />
-          <h2 className="mb-2 font-medium text-destructive text-lg">Compilation Error</h2>
-          <p className="max-w-md text-center text-muted-foreground text-sm">{compileError}</p>
+        <div className="flex flex-1 flex-col items-center justify-center bg-muted/30 p-6">
+          <div className="w-full max-w-lg">
+            <div className="mb-4 flex items-center gap-2 text-destructive">
+              <AlertCircleIcon className="size-5" />
+              <h2 className="font-semibold text-base">Compilation Failed</h2>
+              <span className="ml-auto rounded-full bg-destructive/15 px-2 py-0.5 text-xs font-medium">
+                {errors.length} {errors.length === 1 ? "error" : "errors"}
+              </span>
+            </div>
+            <div className="rounded-lg border border-destructive/20 bg-background">
+              <div className="max-h-60 overflow-y-auto divide-y divide-border">
+                {errors.map((error, i) => (
+                  <div key={i} className="flex items-start gap-2.5 px-3 py-2.5">
+                    <AlertCircleIcon className="mt-0.5 size-3.5 shrink-0 text-destructive/70" />
+                    <span className="text-sm text-foreground">{error}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                onClick={handleFixWithChat}
+                className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90"
+              >
+                <MousePointerClickIcon className="size-3.5" />
+                Fix with Chat
+              </button>
+              <button
+                onClick={handleCompile}
+                className="flex items-center gap-1.5 rounded-lg border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted"
+              >
+                <RefreshCwIcon className="size-3.5" />
+                Retry
+              </button>
+            </div>
+          </div>
         </div>
       );
     }

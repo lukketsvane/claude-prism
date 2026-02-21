@@ -127,6 +127,34 @@
   }
 }
 
+/* Sidebar scrollbar styling */
+.bg-sidebar ::-webkit-scrollbar {
+  width: 6px;
+}
+
+.bg-sidebar ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.bg-sidebar ::-webkit-scrollbar-thumb {
+  background: var(--sidebar-border);
+  border-radius: 3px;
+}
+
+.bg-sidebar ::-webkit-scrollbar-thumb:hover {
+  background: var(--sidebar-ring);
+}
+
+.bg-sidebar {
+  scrollbar-width: thin;
+  scrollbar-color: var(--sidebar-border) transparent;
+}
+
+.bg-sidebar * {
+  scrollbar-width: thin;
+  scrollbar-color: var(--sidebar-border) transparent;
+}
+
 .react-pdf__Page__textContent span {
   cursor: pointer;
   transition: background-color 0.15s ease;

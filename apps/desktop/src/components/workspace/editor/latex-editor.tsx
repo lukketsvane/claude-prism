@@ -13,7 +13,7 @@ import {
   history,
   historyKeymap,
 } from "@codemirror/commands";
-import { syntaxHighlighting } from "@codemirror/language";
+import { syntaxHighlighting, syntaxTreeAvailable } from "@codemirror/language";
 import { oneDark, oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import { defaultHighlightStyle } from "@codemirror/language";
 import { useTheme } from "next-themes";
@@ -288,7 +288,9 @@ export function LatexEditor() {
         setSelectionRange(from !== to ? { start: from, end: to } : null);
 
         // Compute toolbar position below the selection end
-        if (from !== to) {
+        // Skip toolbar for "select all" (Cmd+A) to avoid overlay issues
+        const isSelectAll = from === 0 && to === update.state.doc.length;
+        if (from !== to && !isSelectAll) {
           const startCoords = update.view.coordsAtPos(from);
           const endCoords = update.view.coordsAtPos(to);
           if (endCoords && startCoords) {
@@ -362,6 +364,11 @@ export function LatexEditor() {
         keymap.of([...defaultKeymap, ...historyKeymap]),
         latex({ enableLinting: false }),
         linter((view) => {
+          // Wait until the Lezer parser has fully parsed the document
+          // to avoid false positives from incomplete syntax trees
+          if (!syntaxTreeAvailable(view.state, view.state.doc.length)) {
+            return [];
+          }
           const baseLinter = latexLinter();
           const diagnostics = baseLinter(view);
           return diagnostics.map((d: Diagnostic) => ({
@@ -681,6 +688,15 @@ export function LatexEditor() {
             const fileName = activeFile?.relativePath ?? "document.tex";
             const ctx = `[Lint error in ${fileName}:${line}]\n[Error: ${message}]`;
             useClaudeChatStore.getState().sendPrompt(`${ctx}\n\nFix this lint error.`);
+          }}
+          onFixAllWithChat={() => {
+            const fileName = activeFile?.relativePath ?? "document.tex";
+            const errorList = diagnostics
+              .map((d) => `- ${fileName}:${d.line} — ${d.message}`)
+              .join("\n");
+            useClaudeChatStore.getState().sendPrompt(
+              `[Lint errors in ${fileName}]\n${errorList}\n\nFix all these lint errors.`
+            );
           }}
         />
       )}
