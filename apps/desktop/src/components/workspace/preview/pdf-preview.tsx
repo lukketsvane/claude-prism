@@ -26,6 +26,8 @@ import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover
 import { HistoryPanel } from "@/components/workspace/history-panel";
 import { compileLatex, synctexEdit } from "@/lib/latex-compiler";
 import { SelectionToolbar, type ToolbarAction } from "@/components/workspace/editor/selection-toolbar";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeFile } from "@tauri-apps/plugin-fs";
 import type { PdfTextSelection } from "./pdf-viewer";
 
 const ZOOM_OPTIONS = [
@@ -308,17 +310,21 @@ export function PdfPreview() {
   const zoomIn = () => setScale((s) => Math.min(4, s + 0.1));
   const zoomOut = () => setScale((s) => Math.max(0.25, s - 0.1));
 
-  const handleDownload = () => {
+  const handleExport = async () => {
     if (!pdfData) return;
-    const blob = new Blob([new Uint8Array(pdfData)], { type: "application/pdf" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "document.pdf";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    const mainFile = files.find((f) => f.name === "document.tex" || f.name === "main.tex");
+    const defaultName = mainFile
+      ? mainFile.name.replace(/\.tex$/, ".pdf")
+      : "document.pdf";
+    const filePath = await save({
+      title: "Export PDF",
+      defaultPath: defaultName,
+      filters: [
+        { name: "PDF", extensions: ["pdf"] },
+      ],
+    });
+    if (!filePath) return;
+    await writeFile(filePath, new Uint8Array(pdfData));
   };
 
   const handleLoadSuccess = (pages: number) => setNumPages(pages);
@@ -479,7 +485,7 @@ export function PdfPreview() {
                 <SelectContent>{ZOOM_OPTIONS.map((opt) => (<SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>))}</SelectContent>
               </Select>
               <div className="mx-1 h-4 w-px bg-border" />
-              <Button variant="ghost" size="sm" className="h-7 gap-1.5 px-2.5 text-xs" onClick={handleDownload} title="Download PDF">
+              <Button variant="ghost" size="sm" className="h-7 gap-1.5 px-2.5 text-xs" onClick={handleExport} title="Export PDF">
                 <DownloadIcon className="size-3.5" />
                 Export
               </Button>

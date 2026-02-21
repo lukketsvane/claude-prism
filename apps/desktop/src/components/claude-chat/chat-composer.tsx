@@ -382,7 +382,7 @@ export const ChatComposer: FC = () => {
             value={input}
             onChange={handleInput}
             onKeyDown={handleKeyDown}
-            placeholder="Ask about LaTeX... (@ to mention, drop files to attach)"
+            placeholder="Ask me anything (@ to mention, drop to attach)"
             className="max-h-40 min-h-10 w-full resize-none bg-transparent px-4 py-2 text-sm outline-none placeholder:text-muted-foreground"
             autoFocus
             rows={1}

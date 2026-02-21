@@ -27,6 +27,7 @@ import {
 } from "@codemirror/search";
 import { unifiedMergeView, getChunks, acceptChunk, rejectChunk } from "@codemirror/merge";
 import { latex, latexLinter } from "codemirror-lang-latex";
+import { bibtex } from "./lang-bibtex";
 import { linter, lintGutter, forEachDiagnostic, type Diagnostic } from "@codemirror/lint";
 import { useDocumentStore, type ProjectFile } from "@/stores/document-store";
 import { useProposedChangesStore, type ProposedChange } from "@/stores/proposed-changes-store";
@@ -411,7 +412,7 @@ export function LatexEditor() {
         highlightActiveLineGutter(),
         history(),
         keymap.of([...defaultKeymap, ...historyKeymap]),
-        latex({ enableLinting: false }),
+        activeFile?.type === "bib" ? bibtex() : latex({ enableLinting: false }),
         ...(activeFile?.type === "tex" ? [
           linter((view) => {
             // Wait until the Lezer parser has fully parsed the document
@@ -550,6 +551,7 @@ export function LatexEditor() {
       pendingChangeRef.current = activeFileChange;
       isMergeActiveRef.current = true;
       try {
+        const scrollTop = view.scrollDOM.scrollTop;
         view.dispatch({
           changes: { from: 0, to: view.state.doc.length, insert: activeFileChange.newContent },
           effects: mergeCompartmentRef.current.reconfigure(
@@ -562,6 +564,7 @@ export function LatexEditor() {
           ),
           annotations: Transaction.addToHistory.of(false),
         });
+        view.scrollDOM.scrollTop = scrollTop;
         console.log("[merge-view] merge view activated successfully");
       } catch (err) {
         console.error("[merge-view] failed to activate merge view:", err);
@@ -574,6 +577,7 @@ export function LatexEditor() {
       console.log("[merge-view] UPDATING merge view (stacked edit) for:", activeFileChange.filePath);
       pendingChangeRef.current = activeFileChange;
       try {
+        const scrollTop = view.scrollDOM.scrollTop;
         view.dispatch({
           changes: { from: 0, to: view.state.doc.length, insert: activeFileChange.newContent },
           effects: mergeCompartmentRef.current.reconfigure(
@@ -586,6 +590,7 @@ export function LatexEditor() {
           ),
           annotations: Transaction.addToHistory.of(false),
         });
+        view.scrollDOM.scrollTop = scrollTop;
         console.log("[merge-view] merge view updated successfully (stacked edit)");
       } catch (err) {
         console.error("[merge-view] failed to update merge view:", err);

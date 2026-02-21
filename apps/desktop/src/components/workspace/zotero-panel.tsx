@@ -78,14 +78,14 @@ export function ZoteroPanel() {
           <div className="py-0.5">
             {/* Error */}
             {error && (
-              <div className="mx-2 mb-1 rounded bg-destructive/10 px-2 py-1 text-destructive text-[11px]">
+              <div className="mx-2 mb-1 rounded bg-destructive/10 px-2 py-1 text-destructive text-xs">
                 {error}
               </div>
             )}
 
             {/* Syncing progress */}
             {isSyncing && (
-              <div className="mx-2 mb-0.5 flex items-center gap-1 text-[11px] text-muted-foreground">
+              <div className="mx-2 mb-0.5 flex items-center gap-1 text-xs text-muted-foreground">
                 <LoaderIcon className="size-3 animate-spin" />
                 {syncProgress
                   ? `${syncProgress.loaded}/${syncProgress.total}`
@@ -111,7 +111,7 @@ export function ZoteroPanel() {
             )}
 
             {isLoadingCollections ? (
-              <div className="flex items-center gap-1 px-2 py-1 text-[11px] text-muted-foreground">
+              <div className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground">
                 <LoaderIcon className="size-3 animate-spin" />
                 Loading...
               </div>
@@ -277,16 +277,16 @@ function CollectionRow({
       <span className="shrink-0 text-muted-foreground">{icon}</span>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1">
-          <span className="truncate text-[11px] text-foreground">{name}</span>
+          <span className="truncate text-sm text-foreground">{name}</span>
           {isSynced && <CheckIcon className="size-2.5 shrink-0 text-green-500" />}
         </div>
         {isSynced && (
-          <p className="truncate text-[10px] leading-none text-muted-foreground">
+          <p className="truncate text-xs leading-none text-muted-foreground">
             {syncInfo.bibFileName}
           </p>
         )}
         {!isSynced && itemCount !== undefined && (
-          <p className="text-[10px] leading-none text-muted-foreground">
+          <p className="text-xs leading-none text-muted-foreground">
             {itemCount} items
           </p>
         )}

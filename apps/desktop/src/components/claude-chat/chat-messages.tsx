@@ -1,13 +1,80 @@
-import { type FC, useEffect, useMemo, useRef } from "react";
+import { type FC, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertCircleIcon, BotIcon, UserIcon } from "lucide-react";
 import { useClaudeChatStore, type ClaudeStreamMessage, type ContentBlock } from "@/stores/claude-chat-store";
 import { MarkdownRenderer } from "./markdown-renderer";
 import { ToolWidget } from "./tool-widgets";
 
+const THINKING_MESSAGES = [
+  "Thinking",
+  "Analyzing your document",
+  "Reviewing the structure",
+  "Processing your request",
+  "Almost there",
+  "Working on it",
+  "Diving into the details",
+  "Crafting a response",
+  "Examining the code",
+];
+
+type TypewriterPhase = "typing" | "pausing" | "deleting";
+
+function useTypewriter(
+  words: string[],
+  active: boolean,
+  { typeSpeed = 60, deleteSpeed = 30, pauseDelay = 1800 } = {},
+) {
+  const [text, setText] = useState("");
+  const [wordIndex, setWordIndex] = useState(0);
+  const [phase, setPhase] = useState<TypewriterPhase>("typing");
+
+  // Reset when deactivated
+  useEffect(() => {
+    if (!active) {
+      setText("");
+      setWordIndex(0);
+      setPhase("typing");
+    }
+  }, [active]);
+
+  const tick = useCallback(() => {
+    const current = words[wordIndex];
+
+    if (phase === "typing") {
+      if (text.length < current.length) {
+        setText(current.slice(0, text.length + 1));
+      } else {
+        setPhase("pausing");
+      }
+    } else if (phase === "pausing") {
+      setPhase("deleting");
+    } else if (phase === "deleting") {
+      if (text.length > 0) {
+        setText(current.slice(0, text.length - 1));
+      } else {
+        setWordIndex((prev) => (prev + 1) % words.length);
+        setPhase("typing");
+      }
+    }
+  }, [text, wordIndex, phase, words]);
+
+  useEffect(() => {
+    if (!active) return;
+
+    const delay =
+      phase === "typing" ? typeSpeed : phase === "deleting" ? deleteSpeed : pauseDelay;
+
+    const timeout = setTimeout(tick, delay);
+    return () => clearTimeout(timeout);
+  }, [active, tick, phase, typeSpeed, deleteSpeed, pauseDelay]);
+
+  return { text, phase };
+}
+
 export const ChatMessages: FC = () => {
   const messages = useClaudeChatStore((s) => s.messages);
   const isStreaming = useClaudeChatStore((s) => s.isStreaming);
   const viewportRef = useRef<HTMLDivElement>(null);
+  const { text: thinkingText, phase: thinkingPhase } = useTypewriter(THINKING_MESSAGES, isStreaming);
 
   // Build a map of tool_use_id → tool_result for inline display
   const toolResultMap = useMemo(() => {
@@ -91,7 +158,14 @@ export const ChatMessages: FC = () => {
             <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/50" style={{ animationDelay: "150ms" }} />
             <span className="size-1.5 animate-bounce rounded-full bg-muted-foreground/50" style={{ animationDelay: "300ms" }} />
           </div>
-          <span className="text-sm">Thinking...</span>
+          <span className="text-sm">
+            {thinkingText}
+            <span
+              className={`ml-px inline-block h-[1em] w-0.5 translate-y-px bg-muted-foreground/70 ${
+                thinkingPhase === "pausing" ? "animate-pulse" : ""
+              }`}
+            />
+          </span>
         </div>
       )}
     </div>

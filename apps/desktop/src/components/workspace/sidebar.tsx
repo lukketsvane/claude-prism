@@ -643,7 +643,7 @@ export function Sidebar() {
                 toc.map((item, index) => (
                   <button
                     key={index}
-                    className="flex w-full items-center gap-1.5 rounded-md px-2 py-0.5 text-left text-xs transition-colors hover:bg-sidebar-accent/50"
+                    className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm transition-colors hover:bg-sidebar-accent/50"
                     style={{ paddingLeft: `${(item.level - 1) * 12 + 8}px` }}
                     onClick={() => handleTocClick(item.line)}
                   >
@@ -652,7 +652,7 @@ export function Sidebar() {
                   </button>
                 ))
               ) : (
-                <div className="px-2 py-1 text-muted-foreground text-[11px]">
+                <div className="px-2 py-1 text-muted-foreground text-xs">
                   No sections found
                 </div>
               )}
@@ -960,8 +960,10 @@ function FileTreeNode({
                 : "hover:bg-sidebar-accent/50",
             )}
             style={{ paddingLeft: `${depth * 16 + 8}px` }}
-            onClick={() => onSelectFile(file.id)}
-            onDoubleClick={() => useHistoryStore.getState().stopReview()}
+            onClick={() => {
+              useHistoryStore.getState().stopReview();
+              onSelectFile(file.id);
+            }}
           >
             {getFileIcon(file)}
             <span className="truncate">
